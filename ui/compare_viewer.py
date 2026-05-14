@@ -4,7 +4,8 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui
 from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from loaders.image_io import compose_overlay_rgb, dapi_rgb, mask_outline
 
@@ -28,6 +29,7 @@ class CompareViewer(QWidget):
         self._mask = None
         self._fusion = None
         self._markers = {}
+        self._background_rgb = None
         self._channel_settings = {}
         self._stride = 1
         self._dapi_intensity = 1.0
@@ -43,15 +45,19 @@ class CompareViewer(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(2)
-        self.title = QLabel(f"Viewer {viewer_id}\nNo run selected")
+        self.title = QLabel(f"Viewer {viewer_id}: No run selected")
         self.title.setStyleSheet(
             f"color:rgb({outline_color[0]},{outline_color[1]},{outline_color[2]});"
             "background:#1a1a1a;padding:4px;font-size:11px;font-weight:bold;"
         )
-        self.title.setWordWrap(True)
+        self.title.setWordWrap(False)
+        self.title.setFixedHeight(30)
+        self.title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay.addWidget(self.title)
 
         self.canvas = pg.GraphicsLayoutWidget()
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.setBackground("#060606")
         self.view = self.canvas.addViewBox()
         self.view.setAspectLocked(True)
@@ -68,7 +74,19 @@ class CompareViewer(QWidget):
         lay.addWidget(self.canvas, stretch=1)
 
     def set_run_label(self, text):
-        self.title.setText(text)
+        full = str(text or "")
+        self.title.setToolTip(full)
+        self.title.setText(self._elide(full))
+
+    def _elide(self, text):
+        one_line = " | ".join(str(text).splitlines())
+        metrics = self.title.fontMetrics()
+        width = max(40, self.title.width() - 10)
+        return metrics.elidedText(one_line, Qt.ElideRight, width)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.set_run_label(self.title.toolTip() or self.title.text())
 
     def set_data(self, dapi, mask, stride):
         self._dapi = np.asarray(dapi)
@@ -80,6 +98,10 @@ class CompareViewer(QWidget):
     def set_overlay_data(self, fusion=None, markers=None):
         self._fusion = None if fusion is None else np.asarray(fusion)
         self._markers = markers or {}
+        self.render()
+
+    def set_background_rgb(self, rgb):
+        self._background_rgb = None if rgb is None else np.asarray(rgb, dtype=np.uint8)
         self.render()
 
     def set_display(self, show_outline=None, outline_width=None, dapi_intensity=None,
@@ -130,35 +152,38 @@ class CompareViewer(QWidget):
             return
         dapi = self._dapi
         mask = self._mask
-        fusion = self._fusion
-        if fusion is not None and fusion.shape[:2] != dapi.shape[:2]:
-            fusion = self._match_array_shape(fusion, dapi.shape[:2])
-        marker_layers = []
-        for name, arr in self._markers.items():
-            st = self._channel_settings.get(name, {})
-            if not st.get("visible", False):
-                continue
-            arr = self._match_array_shape(arr, dapi.shape[:2])
-            marker_layers.append(
-                {
-                    "array": arr,
-                    "color": st.get("rgb", (255, 255, 255)),
-                    "alpha": st.get("alpha", 0.65),
-                    "p_low": st.get("p_low", 1.0),
-                    "p_high": st.get("p_high", 99.5),
-                }
-            )
-        if marker_layers or self._show_fusion:
-            rgb = compose_overlay_rgb(dapi, fusion=fusion, marker_layers=marker_layers,
-                                      dapi_visible=self._show_dapi, fusion_visible=self._show_fusion,
-                                      dapi_intensity=self._dapi_intensity,
-                                      fusion_intensity=self._fusion_intensity,
-                                      dapi_color=self._dapi_color,
-                                      fusion_color=self._fusion_color)
-        elif self._show_dapi:
-            rgb = dapi_rgb(dapi, self._dapi_intensity, color=self._dapi_color)
+        if self._background_rgb is not None:
+            rgb = self._match_array_shape(self._background_rgb, dapi.shape[:2]).astype(np.uint8, copy=False)
         else:
-            rgb = np.zeros(dapi.shape + (3,), dtype=np.uint8)
+            fusion = self._fusion
+            if fusion is not None and fusion.shape[:2] != dapi.shape[:2]:
+                fusion = self._match_array_shape(fusion, dapi.shape[:2])
+            marker_layers = []
+            for name, arr in self._markers.items():
+                st = self._channel_settings.get(name, {})
+                if not st.get("visible", False):
+                    continue
+                arr = self._match_array_shape(arr, dapi.shape[:2])
+                marker_layers.append(
+                    {
+                        "array": arr,
+                        "color": st.get("rgb", (255, 255, 255)),
+                        "alpha": st.get("alpha", 0.65),
+                        "p_low": st.get("p_low", 1.0),
+                        "p_high": st.get("p_high", 99.5),
+                    }
+                )
+            if marker_layers or self._show_fusion:
+                rgb = compose_overlay_rgb(dapi, fusion=fusion, marker_layers=marker_layers,
+                                          dapi_visible=self._show_dapi, fusion_visible=self._show_fusion,
+                                          dapi_intensity=self._dapi_intensity,
+                                          fusion_intensity=self._fusion_intensity,
+                                          dapi_color=self._dapi_color,
+                                          fusion_color=self._fusion_color)
+            elif self._show_dapi:
+                rgb = dapi_rgb(dapi, self._dapi_intensity, color=self._dapi_color)
+            else:
+                rgb = np.zeros(dapi.shape + (3,), dtype=np.uint8)
         if mask is not None:
             rgb = self._render_mask_overlay_rgb(rgb, mask)
         self.image_item.setImage(rgb, autoLevels=False)

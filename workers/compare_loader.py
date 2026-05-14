@@ -7,6 +7,7 @@ import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from loaders.image_io import (
+    compose_overlay_rgb,
     downsample_view,
     overview_stride,
     read_fusion_region,
@@ -220,3 +221,131 @@ class PatchLoadWorker(QThread):
         for tile in hits:
             print(f"[Viewer{self.viewer_id}] using tile r={tile.get('row')} c={tile.get('col')} bbox={tile.get('bbox_local')}")
         return dapi_canvas, mask_canvas
+
+
+class MarkerLoadWorker(QThread):
+    loaded = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+    def __init__(self, generation, roi, bbox, channels, cache_keys, stride=1, parent=None):
+        super().__init__(parent)
+        self.generation = int(generation)
+        self.roi = roi
+        self.bbox = [int(v) for v in bbox]
+        self.channels = list(channels or [])
+        self.cache_keys = dict(cache_keys or {})
+        self.stride = max(1, int(stride))
+
+    def run(self):
+        try:
+            y0, y1, x0, x1 = self.bbox
+            out = {}
+            for ch in self.channels:
+                arr = None
+                try:
+                    if ch.source == "corrected_zarr":
+                        roi_names = [
+                            getattr(self.roi, "roi_id", None),
+                            getattr(self.roi, "display_name", None),
+                            "ROI_1",
+                        ]
+                        for roi_name in roi_names:
+                            try:
+                                arr = read_zarr_channel(
+                                    self.roi.corrected_zarr,
+                                    ch.name,
+                                    roi_name=roi_name,
+                                    y0=y0,
+                                    y1=y1,
+                                    x0=x0,
+                                    x1=x1,
+                                    stride=self.stride,
+                                )
+                                break
+                            except Exception:
+                                arr = None
+                    elif ch.source == "raw_ome" and getattr(self.roi, "raw_ome", None):
+                        rb = getattr(self.roi, "bbox_fullres", None) or [0, 0, 0, 0]
+                        gy0, gy1 = int(rb[0]) + y0, int(rb[0]) + y1
+                        gx0, gx1 = int(rb[2]) + x0, int(rb[2]) + x1
+                        arr = read_raw_ome_channel_region(
+                            self.roi.raw_ome,
+                            ch.name,
+                            [gy0, gy1, gx0, gx1],
+                            stride=self.stride,
+                        )
+                    if arr is not None:
+                        out[ch.name] = (self.cache_keys.get(ch.name), np.asarray(arr))
+                        print(f"[MarkerLoad] generation={self.generation} loaded {ch.name} shape={getattr(arr, 'shape', None)}")
+                except Exception:
+                    print(f"[MarkerLoad] generation={self.generation} skipped {ch.name}:\n{traceback.format_exc()}")
+            self.loaded.emit(self.generation, out)
+        except Exception:
+            self.failed.emit(self.generation, traceback.format_exc())
+
+
+class CompositeWorker(QThread):
+    composed = pyqtSignal(int, object, object)
+    failed = pyqtSignal(int, str)
+
+    def __init__(self, generation, cache_key, dapi, fusion, marker_arrays, marker_settings,
+                 show_dapi=True, show_fusion=False, dapi_intensity=1.0, fusion_intensity=1.0,
+                 dapi_color=(51, 102, 255), fusion_color=(255, 51, 51), parent=None):
+        super().__init__(parent)
+        self.generation = int(generation)
+        self.cache_key = cache_key
+        self.dapi = np.asarray(dapi)
+        self.fusion = None if fusion is None else np.asarray(fusion)
+        self.marker_arrays = dict(marker_arrays or {})
+        self.marker_settings = dict(marker_settings or {})
+        self.show_dapi = bool(show_dapi)
+        self.show_fusion = bool(show_fusion)
+        self.dapi_intensity = float(dapi_intensity)
+        self.fusion_intensity = float(fusion_intensity)
+        self.dapi_color = dapi_color
+        self.fusion_color = fusion_color
+
+    def run(self):
+        try:
+            layers = []
+            target = self.dapi.shape[:2]
+            for name, arr in self.marker_arrays.items():
+                st = self.marker_settings.get(name, {})
+                a = self._match_shape(np.asarray(arr), target)
+                layers.append(
+                    {
+                        "array": a,
+                        "color": st.get("rgb", (255, 255, 255)),
+                        "alpha": st.get("alpha", 0.65),
+                        "p_low": st.get("p_low", 1.0),
+                        "p_high": st.get("p_high", 99.5),
+                    }
+                )
+            fusion = None if self.fusion is None else self._match_shape(self.fusion, target)
+            rgb = compose_overlay_rgb(
+                self.dapi,
+                fusion=fusion,
+                marker_layers=layers,
+                dapi_visible=self.show_dapi,
+                fusion_visible=self.show_fusion,
+                dapi_intensity=self.dapi_intensity,
+                fusion_intensity=self.fusion_intensity,
+                dapi_color=self.dapi_color,
+                fusion_color=self.fusion_color,
+            )
+            print(f"[Composite] generation={self.generation} composed markers={list(self.marker_arrays)} shape={rgb.shape}")
+            self.composed.emit(self.generation, self.cache_key, rgb)
+        except Exception:
+            self.failed.emit(self.generation, traceback.format_exc())
+
+    @staticmethod
+    def _match_shape(arr, target):
+        if arr.shape[:2] == tuple(target):
+            return arr
+        th, tw = target
+        out = np.zeros((th, tw) + arr.shape[2:], dtype=arr.dtype)
+        mh = min(th, int(arr.shape[0]))
+        mw = min(tw, int(arr.shape[1]))
+        if mh > 0 and mw > 0:
+            out[:mh, :mw, ...] = arr[:mh, :mw, ...]
+        return out

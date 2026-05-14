@@ -2,8 +2,9 @@
 
 import os
 
+import numpy as np
 from PyQt5 import QtGui, QtWidgets
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QFileDialog,
     QCheckBox,
@@ -17,8 +18,10 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -28,7 +31,7 @@ from configs.defaults import OUTLINE_WIDTH_OPTIONS, DEFAULT_OUTLINE_WIDTH_INDEX
 from loaders.project_loader import ProjectLoader
 from ui.compare_viewer import CompareViewer
 from ui.overview_viewer import OverviewViewer
-from workers.compare_loader import PatchLoadWorker, RunLoadWorker
+from workers.compare_loader import CompositeWorker, MarkerLoadWorker, PatchLoadWorker, RunLoadWorker
 
 
 class Step31ComparePage(QWidget):
@@ -56,6 +59,21 @@ class Step31ComparePage(QWidget):
         self._preview_roi = None
         self._preview_stride = 1
         self._loading_runs = set()
+        self._viewer_names = {}
+        self._viewer_auto_names = set()
+        self._shared_dapi = None
+        self._shared_fusion = None
+        self._shared_bbox = None
+        self._marker_cache = {}
+        self._composite_cache = {}
+        self._marker_generation = 0
+        self._pending_marker_worker = None
+        self._pending_composite_worker = None
+        self._marker_workers = []
+        self._composite_workers = []
+        self._marker_refresh_timer = QTimer(self)
+        self._marker_refresh_timer.setSingleShot(True)
+        self._marker_refresh_timer.timeout.connect(self._refresh_shared_background)
         self._outline_colors = {
             key: self._hex_to_rgb(value) for key, value in VIEWER_COLORS.items()
         }
@@ -138,9 +156,17 @@ class Step31ComparePage(QWidget):
         il.addLayout(roi_row)
         lay.addWidget(input_box)
 
-        preview_box = QGroupBox("Preview / Patch")
+        tabs = QTabWidget()
+        tabs.setStyleSheet(
+            "QTabWidget::pane{border:1px solid #444;border-radius:5px;}"
+            "QTabBar::tab{background:#222;color:#bbb;padding:5px 12px;border:1px solid #444;}"
+            "QTabBar::tab:selected{color:#fff;border-bottom-color:#111;}"
+        )
+
+        preview_box = QGroupBox("Preview / ROI")
         preview_box.setStyleSheet(self._box_style("#e5c07b"))
         pl = QVBoxLayout(preview_box)
+        pl.setContentsMargins(6, 6, 6, 6)
         hint = QLabel("Draw a QC patch on the ROI preview. The comparison viewers reload this patch at full resolution.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#aaa;font-size:10px;")
@@ -148,9 +174,9 @@ class Step31ComparePage(QWidget):
         self.preview = OverviewViewer()
         self.preview.roi_changed.connect(self._on_preview_roi_changed)
         pl.addWidget(self.preview, stretch=1)
-        lay.addWidget(preview_box, stretch=3)
-
-        lay.addWidget(self._make_channel_overlay_panel(), stretch=4)
+        tabs.addTab(preview_box, "Preview / ROI")
+        tabs.addTab(self._make_channel_overlay_panel(), "Channel Overlay")
+        lay.addWidget(tabs, stretch=1)
         return panel
 
     def _make_compact_toolbar(self):
@@ -279,6 +305,8 @@ class Step31ComparePage(QWidget):
         run_lay = QVBoxLayout(run_box)
         run_row = QHBoxLayout()
         self.run_combos = {}
+        self.viewer_name_edits = {}
+        self.viewer_color_btns = {}
         for viewer_id in ("A", "B", "C", "D"):
             run_row.addWidget(QLabel(f"Viewer {viewer_id}:"))
             combo = QComboBox()
@@ -286,10 +314,38 @@ class Step31ComparePage(QWidget):
             self.run_combos[viewer_id] = combo
             run_row.addWidget(combo, stretch=1)
         run_lay.addLayout(run_row)
+        run_lay.addLayout(self._make_viewer_identity_controls())
         run_lay.addWidget(self._make_compact_toolbar())
         lay.addWidget(run_box)
         lay.addWidget(self._make_viewer_grid(), stretch=3)
         return box
+
+    def _make_viewer_identity_controls(self):
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(3)
+        for col, viewer_id in enumerate(("A", "B", "C", "D")):
+            name = QLineEdit()
+            name.setPlaceholderText(f"Viewer {viewer_id} name")
+            name.setFixedHeight(22)
+            name.textEdited.connect(lambda _text, vid=viewer_id: self._on_viewer_name_edited(vid))
+            color_btn = QPushButton()
+            color_btn.setFixedSize(24, 20)
+            color_btn.setToolTip(f"Viewer {viewer_id} outline color")
+            color_btn.clicked.connect(lambda _=False, vid=viewer_id: self._choose_viewer_color(vid))
+            self.viewer_name_edits[viewer_id] = name
+            self.viewer_color_btns[viewer_id] = color_btn
+            self._update_viewer_color_button(viewer_id)
+            cell = QWidget()
+            cell_lay = QHBoxLayout(cell)
+            cell_lay.setContentsMargins(0, 0, 0, 0)
+            cell_lay.setSpacing(3)
+            cell_lay.addWidget(name, stretch=1)
+            cell_lay.addWidget(color_btn)
+            grid.addWidget(QLabel(f"{viewer_id} name"), 0, col)
+            grid.addWidget(cell, 1, col)
+        return grid
 
     def _make_viewer_grid(self):
         grid_w = QWidget()
@@ -300,10 +356,15 @@ class Step31ComparePage(QWidget):
         positions = {"A": (0, 0), "B": (0, 1), "C": (1, 0), "D": (1, 1)}
         for viewer_id, pos in positions.items():
             viewer = CompareViewer(viewer_id, self._outline_colors[viewer_id])
+            viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             viewer.view_changed.connect(self._on_view_changed)
             viewer.selected.connect(self._on_viewer_selected)
             self.viewers[viewer_id] = viewer
             grid.addWidget(viewer, *pos)
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
         return grid_w
 
     def _browse_project(self):
@@ -336,6 +397,11 @@ class Step31ComparePage(QWidget):
             return
         self._runs = self._loader.runs_for_roi(roi)
         self._channels = self._loader.channels_for_roi(roi)
+        self._marker_cache.clear()
+        self._composite_cache.clear()
+        self._shared_dapi = None
+        self._shared_fusion = None
+        self._shared_bbox = None
         self._rebuild_channel_controls()
         self._run_by_id = {run.run_id: run for run in self._runs}
         print(f"[Step3.1] selected roi_id={roi.roi_id}")
@@ -368,7 +434,7 @@ class Step31ComparePage(QWidget):
         for viewer_id, combo in self.run_combos.items():
             run_id = combo.currentData()
             if not run_id:
-                self.viewers[viewer_id].set_run_label(f"Viewer {viewer_id}\nNo run selected")
+                self.viewers[viewer_id].set_run_label(f"Viewer {viewer_id}: No run selected")
                 continue
             run = self._run_by_id.get(run_id)
             if run is None:
@@ -399,7 +465,8 @@ class Step31ComparePage(QWidget):
         label = f"{run.display_name}\n{run.created_at}"
         if run.cell_count is not None:
             label += f"\ncells={run.cell_count:,}"
-        self.viewers[viewer_id].set_run_label(label + "\nloading overview...")
+        self._ensure_viewer_name(viewer_id, run)
+        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run, "loading overview"))
         print(f"[Viewer{viewer_id}] run_id={run.run_id}")
         print(f"[Viewer{viewer_id}] method={run.method}")
         print(f"[Viewer{viewer_id}] dapi={run.dapi_ome}")
@@ -415,7 +482,8 @@ class Step31ComparePage(QWidget):
     def _on_run_loaded(self, viewer_id, run, label, dapi, mask, stride, overlays):
         self._selected_runs[viewer_id] = run
         self._loading_runs.discard(viewer_id)
-        self.viewers[viewer_id].set_run_label(label + "\nDraw patch on preview")
+        self._ensure_viewer_name(viewer_id, run)
+        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run, "draw patch"))
         if viewer_id == "A" or self.preview._dapi is None:
             self._preview_stride = stride
             self.preview.set_data(dapi, stride=stride)
@@ -428,15 +496,10 @@ class Step31ComparePage(QWidget):
         roi = self.roi_combo.currentData()
         if roi is None or bbox is None:
             return
-        visible_channels = [
-            ch for ch in self._channels
-            if self._channel_settings.get(ch.name, {}).get("check")
-            and self._channel_settings[ch.name]["check"].isChecked()
-        ]
-        self.viewers[viewer_id].set_run_label(self._viewer_label(run) + "\nloading patch...")
+        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run, "loading patch"))
         print(f"[Viewer{viewer_id}] patch local bbox={list(bbox)}")
         print(f"[Step3.1] crop bbox={list(bbox)}")
-        worker = PatchLoadWorker(viewer_id, run, roi, bbox, channels=visible_channels, stride=1, parent=self)
+        worker = PatchLoadWorker(viewer_id, run, roi, bbox, channels=[], stride=1, parent=self)
         worker.loaded.connect(lambda vid, dapi, mask, fusion, markers, b, r=run: self._on_patch_loaded(vid, r, dapi, mask, fusion, markers, b))
         worker.failed.connect(self._on_run_failed)
         self._workers[f"patch_{viewer_id}"] = worker
@@ -456,11 +519,66 @@ class Step31ComparePage(QWidget):
             label += f"\ncells={run.cell_count:,}"
         return label
 
+    def _viewer_name(self, viewer_id):
+        return self._viewer_names.get(viewer_id) or f"Viewer {viewer_id}"
+
+    def _ensure_viewer_name(self, viewer_id, run):
+        edit = self.viewer_name_edits.get(viewer_id)
+        current = self._viewer_names.get(viewer_id, "")
+        if current and viewer_id not in self._viewer_auto_names:
+            return
+        name = run.display_name or run.method or f"Viewer {viewer_id}"
+        self._viewer_names[viewer_id] = name
+        self._viewer_auto_names.add(viewer_id)
+        if edit is not None and edit.text() != name:
+            edit.blockSignals(True)
+            edit.setText(name)
+            edit.blockSignals(False)
+
+    def _viewer_title_text(self, viewer_id, run, suffix=None):
+        bits = [self._viewer_name(viewer_id), run.method or run.display_name or run.run_id]
+        if suffix:
+            bits.append(suffix)
+        text = " | ".join(str(b) for b in bits if b)
+        detail = self._viewer_label(run)
+        return f"{text}\n{detail}"
+
+    def _on_viewer_name_edited(self, viewer_id):
+        edit = self.viewer_name_edits.get(viewer_id)
+        name = edit.text().strip() if edit is not None else ""
+        self._viewer_names[viewer_id] = name or f"Viewer {viewer_id}"
+        self._viewer_auto_names.discard(viewer_id)
+        run = self._selected_runs.get(viewer_id)
+        if run is not None:
+            self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run))
+        else:
+            self.viewers[viewer_id].set_run_label(f"{self._viewer_name(viewer_id)} | No run selected")
+
+    def _choose_viewer_color(self, viewer_id):
+        cur = QtGui.QColor(*self._outline_colors[viewer_id])
+        color = QtWidgets.QColorDialog.getColor(cur, self, f"Viewer {viewer_id} outline color")
+        if not color.isValid():
+            return
+        self._outline_colors[viewer_id] = (color.red(), color.green(), color.blue())
+        self._update_viewer_color_button(viewer_id)
+        self.viewers[viewer_id].set_outline_color(self._outline_colors[viewer_id])
+
+    def _update_viewer_color_button(self, viewer_id):
+        btn = self.viewer_color_btns.get(viewer_id)
+        if btn is None:
+            return
+        color = QtGui.QColor(*self._outline_colors[viewer_id]).name()
+        btn.setStyleSheet(f"background:{color};border:1px solid #777;")
+
     def _on_patch_loaded(self, viewer_id, run, dapi, mask, fusion, markers, bbox):
-        self.viewers[viewer_id].set_run_label(self._viewer_label(run))
+        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run))
         self.viewers[viewer_id].set_data(dapi, mask, 1)
-        self.viewers[viewer_id].set_overlay_data(fusion=fusion, markers=markers)
+        self.viewers[viewer_id].set_overlay_data(fusion=fusion, markers={})
+        self._shared_dapi = np.asarray(dapi)
+        self._shared_fusion = None if fusion is None else np.asarray(fusion)
+        self._shared_bbox = tuple(int(v) for v in bbox)
         self._update_display_controls()
+        self._schedule_marker_refresh("patch loaded")
         print(f"[Step3.1] viewer slot {viewer_id} -> result name={run.display_name} method={run.method}")
         print(f"[Step3.1] viewer slot {viewer_id} -> mask path={run.mask_ome}")
         print(f"[Step3.1] viewer slot {viewer_id} -> mask shape={getattr(mask, 'shape', None)}")
@@ -470,7 +588,7 @@ class Step31ComparePage(QWidget):
         self.status.setText(f"Patch loaded: y={y0}:{y1} x={x0}:{x1}")
 
     def _on_run_failed(self, viewer_id, error):
-        self.viewers[viewer_id].set_run_label(f"Viewer {viewer_id}\nLoad failed")
+        self.viewers[viewer_id].set_run_label(f"{self._viewer_name(viewer_id)} | Load failed")
         self._loading_runs.discard(viewer_id)
         print(f"[Viewer{viewer_id}] load failed:\n{error}")
         QMessageBox.warning(self, "Step3.1", f"Viewer {viewer_id} failed to load.\n\n{error[:1200]}")
@@ -523,12 +641,13 @@ class Step31ComparePage(QWidget):
                 show_fusion=self.fusion_chk.isChecked(),
                 channel_settings=channel_settings,
             )
+        self._schedule_marker_refresh("display controls")
 
     def _on_channel_controls_changed(self):
+        self._marker_generation += 1
+        print(f"[ChannelOverlay] state changed generation={self._marker_generation}; debounce 150ms")
         self._update_display_controls()
-        if self._preview_roi is not None:
-            for viewer_id, run in self._selected_runs.items():
-                self._start_patch_load(viewer_id, run, self._preview_roi)
+        self._marker_refresh_timer.start(150)
 
     def _choose_current_color(self):
         cur = QtGui.QColor(*self._outline_colors[self._selected_viewer])
@@ -536,6 +655,7 @@ class Step31ComparePage(QWidget):
         if not color.isValid():
             return
         self._outline_colors[self._selected_viewer] = (color.red(), color.green(), color.blue())
+        self._update_viewer_color_button(self._selected_viewer)
         self.viewers[self._selected_viewer].set_outline_color(self._outline_colors[self._selected_viewer])
 
     @staticmethod
@@ -548,6 +668,7 @@ class Step31ComparePage(QWidget):
         if bounds is None:
             self.status.setText("ROI cleared")
         else:
+            self._composite_cache.clear()
             y0, y1, x0, x1 = bounds
             self.status.setText(f"ROI y={y0}:{y1} x={x0}:{x1}")
             roi = self.roi_combo.currentData()
@@ -635,7 +756,7 @@ class Step31ComparePage(QWidget):
     def _clear_marker_channels(self):
         for widgets in self._channel_settings.values():
             widgets["check"].setChecked(False)
-        self._update_display_controls()
+        self._on_channel_controls_changed()
 
     def _choose_layer_color(self, layer):
         current = self._dapi_color if layer == "dapi" else self._fusion_color
@@ -663,6 +784,164 @@ class Step31ComparePage(QWidget):
             }
         return out
 
+    def _visible_marker_records(self, settings=None):
+        settings = settings or self._current_channel_settings()
+        by_name = {ch.name: ch for ch in self._channels}
+        return [by_name[name] for name, st in settings.items() if st.get("visible") and name in by_name]
+
+    def _marker_cache_key(self, roi, bbox, ch_name, st):
+        return (
+            getattr(roi, "roi_id", ""),
+            tuple(int(v) for v in bbox),
+            ch_name,
+            round(float(st.get("p_low", 1.0)), 3),
+            round(float(st.get("p_high", 99.5)), 3),
+        )
+
+    def _composite_cache_key(self, roi, bbox, settings):
+        active = []
+        for name, st in sorted(settings.items()):
+            if not st.get("visible") or name.startswith("__"):
+                continue
+            active.append(
+                (
+                    name,
+                    st.get("rgb"),
+                    round(float(st.get("alpha", 0.65)), 3),
+                    round(float(st.get("p_low", 1.0)), 3),
+                    round(float(st.get("p_high", 99.5)), 3),
+                )
+            )
+        dapi_color = QtGui.QColor(self._dapi_color)
+        fusion_color = QtGui.QColor(self._fusion_color)
+        return (
+            getattr(roi, "roi_id", ""),
+            tuple(int(v) for v in bbox),
+            bool(self.dapi_chk.isChecked()),
+            bool(self.fusion_chk.isChecked()),
+            round(self.dapi_slider.value() / 100.0, 3),
+            round(self.fusion_slider.value() / 100.0, 3),
+            (dapi_color.red(), dapi_color.green(), dapi_color.blue()),
+            (fusion_color.red(), fusion_color.green(), fusion_color.blue()),
+            tuple(active),
+        )
+
+    def _schedule_marker_refresh(self, reason):
+        if not hasattr(self, "_marker_refresh_timer"):
+            return
+        self._marker_generation += 1
+        print(f"[ChannelOverlay] schedule refresh generation={self._marker_generation} reason={reason}")
+        self._marker_refresh_timer.start(150)
+
+    def _refresh_shared_background(self):
+        generation = int(self._marker_generation)
+        roi = self.roi_combo.currentData()
+        if roi is None or self._shared_dapi is None or self._shared_bbox is None:
+            print(f"[ChannelOverlay] generation={generation} skipped; no patch loaded")
+            return
+        settings = self._current_channel_settings()
+        channels = self._visible_marker_records(settings)
+        composite_key = self._composite_cache_key(roi, self._shared_bbox, settings)
+        if composite_key in self._composite_cache:
+            print(f"[ChannelOverlay] composite cache hit generation={generation}")
+            self._apply_shared_background(generation, self._composite_cache[composite_key])
+            return
+        print(f"[ChannelOverlay] composite cache miss generation={generation}")
+        missing = []
+        cache_keys = {}
+        marker_arrays = {}
+        for ch in channels:
+            st = settings.get(ch.name, {})
+            key = self._marker_cache_key(roi, self._shared_bbox, ch.name, st)
+            cache_keys[ch.name] = key
+            if key in self._marker_cache:
+                print(f"[ChannelOverlay] marker cache hit generation={generation} channel={ch.name}")
+                marker_arrays[ch.name] = self._marker_cache[key]
+            else:
+                print(f"[ChannelOverlay] marker cache miss generation={generation} channel={ch.name}")
+                missing.append(ch)
+        if missing:
+            worker = MarkerLoadWorker(generation, roi, self._shared_bbox, missing, cache_keys, stride=1, parent=self)
+            worker.loaded.connect(lambda gen, loaded, arrays=marker_arrays, st=settings, ckey=composite_key: self._on_marker_loaded(gen, loaded, arrays, st, ckey))
+            worker.failed.connect(self._on_marker_failed)
+            worker.finished.connect(lambda w=worker: self._forget_marker_worker(w))
+            self._pending_marker_worker = worker
+            self._marker_workers.append(worker)
+            worker.start()
+            return
+        self._start_composite_worker(generation, composite_key, marker_arrays, settings)
+
+    def _on_marker_loaded(self, generation, loaded, marker_arrays, settings, composite_key):
+        if int(generation) != int(self._marker_generation):
+            print(f"[ChannelOverlay] discard marker generation={generation}; current={self._marker_generation}")
+            return
+        for name, payload in dict(loaded or {}).items():
+            key, arr = payload
+            if key is not None:
+                self._marker_cache[key] = arr
+                marker_arrays[name] = arr
+        self._start_composite_worker(generation, composite_key, marker_arrays, settings)
+
+    def _on_marker_failed(self, generation, error):
+        if int(generation) != int(self._marker_generation):
+            print(f"[ChannelOverlay] discard marker error generation={generation}; current={self._marker_generation}")
+            return
+        print(f"[ChannelOverlay] marker load failed generation={generation}:\n{error}")
+
+    def _start_composite_worker(self, generation, composite_key, marker_arrays, settings):
+        if int(generation) != int(self._marker_generation):
+            print(f"[Composite] discard before start generation={generation}; current={self._marker_generation}")
+            return
+        dapi_color = QtGui.QColor(self._dapi_color)
+        fusion_color = QtGui.QColor(self._fusion_color)
+        worker = CompositeWorker(
+            generation,
+            composite_key,
+            self._shared_dapi,
+            self._shared_fusion,
+            marker_arrays,
+            settings,
+            show_dapi=self.dapi_chk.isChecked(),
+            show_fusion=self.fusion_chk.isChecked(),
+            dapi_intensity=self.dapi_slider.value() / 100.0,
+            fusion_intensity=self.fusion_slider.value() / 100.0,
+            dapi_color=(dapi_color.red(), dapi_color.green(), dapi_color.blue()),
+            fusion_color=(fusion_color.red(), fusion_color.green(), fusion_color.blue()),
+            parent=self,
+        )
+        worker.composed.connect(self._on_composite_ready)
+        worker.failed.connect(self._on_composite_failed)
+        worker.finished.connect(lambda w=worker: self._forget_composite_worker(w))
+        self._pending_composite_worker = worker
+        self._composite_workers.append(worker)
+        worker.start()
+
+    def _on_composite_ready(self, generation, composite_key, rgb):
+        if int(generation) != int(self._marker_generation):
+            print(f"[Composite] generation discard={generation}; current={self._marker_generation}")
+            return
+        self._composite_cache[composite_key] = rgb
+        self._apply_shared_background(generation, rgb)
+
+    def _on_composite_failed(self, generation, error):
+        if int(generation) != int(self._marker_generation):
+            print(f"[Composite] discard error generation={generation}; current={self._marker_generation}")
+            return
+        print(f"[Composite] failed generation={generation}:\n{error}")
+
+    def _apply_shared_background(self, generation, rgb):
+        print(f"[Composite] apply generation={generation}")
+        for viewer in self.viewers.values():
+            viewer.set_background_rgb(rgb)
+
+    def _forget_marker_worker(self, worker):
+        if worker in self._marker_workers:
+            self._marker_workers.remove(worker)
+
+    def _forget_composite_worker(self, worker):
+        if worker in self._composite_workers:
+            self._composite_workers.remove(worker)
+
     def _choose_channel_color(self, name):
         widgets = self._channel_settings.get(name)
         if not widgets:
@@ -673,7 +952,4 @@ class Step31ComparePage(QWidget):
             return
         widgets["color"] = color.name()
         widgets["button"].setStyleSheet(f"background:{color.name()}; border:1px solid #666;")
-        self._update_display_controls()
-        if self._preview_roi is not None:
-            for viewer_id, run in self._selected_runs.items():
-                self._start_patch_load(viewer_id, run, self._preview_roi)
+        self._on_channel_controls_changed()
