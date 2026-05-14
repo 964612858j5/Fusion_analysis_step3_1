@@ -6,7 +6,7 @@ from PyQt5 import QtCore, QtGui
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from loaders.image_io import compose_overlay_rgb, dapi_rgb, mask_fill_rgba, outline_rgba
+from loaders.image_io import compose_overlay_rgb, dapi_rgb, mask_outline
 
 
 class CompareViewer(QWidget):
@@ -58,16 +58,11 @@ class CompareViewer(QWidget):
         self.view.invertY(True)
         self.view.setMenuEnabled(False)
         self.image_item = pg.ImageItem()
-        self.fill_item = pg.ImageItem()
-        self.outline_item = pg.ImageItem()
-        for item in (self.image_item, self.fill_item, self.outline_item):
-            try:
-                item.setOpts(axisOrder="row-major")
-            except Exception:
-                pass
+        try:
+            self.image_item.setOpts(axisOrder="row-major")
+        except Exception:
+            pass
         self.view.addItem(self.image_item)
-        self.view.addItem(self.fill_item)
-        self.view.addItem(self.outline_item)
         self.view.sigRangeChanged.connect(self._on_range_changed)
         self.canvas.scene().sigMouseClicked.connect(self._on_mouse_clicked)
         lay.addWidget(self.canvas, stretch=1)
@@ -132,17 +127,18 @@ class CompareViewer(QWidget):
     def render(self):
         if self._dapi is None:
             self.image_item.clear()
-            self.fill_item.clear()
-            self.outline_item.clear()
             return
         dapi = self._dapi
         mask = self._mask
         fusion = self._fusion
+        if fusion is not None and fusion.shape[:2] != dapi.shape[:2]:
+            fusion = self._match_array_shape(fusion, dapi.shape[:2])
         marker_layers = []
         for name, arr in self._markers.items():
             st = self._channel_settings.get(name, {})
             if not st.get("visible", False):
                 continue
+            arr = self._match_array_shape(arr, dapi.shape[:2])
             marker_layers.append(
                 {
                     "array": arr,
@@ -163,15 +159,53 @@ class CompareViewer(QWidget):
             rgb = dapi_rgb(dapi, self._dapi_intensity, color=self._dapi_color)
         else:
             rgb = np.zeros(dapi.shape + (3,), dtype=np.uint8)
+        if mask is not None:
+            rgb = self._render_mask_overlay_rgb(rgb, mask)
         self.image_item.setImage(rgb, autoLevels=False)
-        if mask is not None and self._mask_alpha > 0:
-            self.fill_item.setImage(mask_fill_rgba(mask, self.outline_color, self._mask_alpha), autoLevels=False)
-        else:
-            self.fill_item.clear()
-        if self._show_outline and mask is not None:
-            self.outline_item.setImage(outline_rgba(mask, self.outline_color, self._outline_width), autoLevels=False)
-        else:
-            self.outline_item.clear()
+
+    @staticmethod
+    def _match_array_shape(arr, target):
+        a = np.asarray(arr)
+        if a.shape[:2] == tuple(target):
+            return a
+        th, tw = target
+        out_shape = (th, tw) + a.shape[2:]
+        out = np.zeros(out_shape, dtype=a.dtype)
+        mh = min(th, int(a.shape[0]))
+        mw = min(tw, int(a.shape[1]))
+        if mh > 0 and mw > 0:
+            out[:mh, :mw, ...] = a[:mh, :mw, ...]
+        return out
+
+    def _render_mask_overlay_rgb(self, rgb, mask):
+        out = np.asarray(rgb, dtype=np.uint8).copy()
+        m = np.asarray(mask)
+        if m.ndim > 2:
+            m = np.squeeze(m)
+        if m.shape[:2] != out.shape[:2]:
+            h = min(out.shape[0], m.shape[0])
+            w = min(out.shape[1], m.shape[1])
+            fixed = np.zeros(out.shape[:2], dtype=m.dtype)
+            if h > 0 and w > 0:
+                fixed[:h, :w] = m[:h, :w]
+            m = fixed
+        fg = m > 0
+        if np.any(fg) and self._mask_alpha > 0:
+            color = np.asarray(self.outline_color, dtype=np.float32)
+            alpha = float(np.clip(self._mask_alpha, 0.0, 1.0))
+            blended = out[fg].astype(np.float32) * (1.0 - alpha) + color[None, :] * alpha
+            out[fg] = np.clip(blended, 0, 255).astype(np.uint8)
+        if self._show_outline and np.any(fg):
+            outline = mask_outline(m)
+            if self._outline_width > 1.0:
+                try:
+                    from scipy import ndimage as ndi
+
+                    outline = ndi.binary_dilation(outline, iterations=max(1, int(round(self._outline_width)) - 1))
+                except Exception:
+                    pass
+            out[outline] = np.asarray(self.outline_color, dtype=np.uint8)
+        return out
 
     def reset_view(self):
         self.view.autoRange()

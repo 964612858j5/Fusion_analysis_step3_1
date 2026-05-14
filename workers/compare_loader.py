@@ -1,7 +1,9 @@
 """Background loading workers for comparator viewers."""
 
+import os
 import traceback
 
+import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from loaders.image_io import (
@@ -90,13 +92,23 @@ class PatchLoadWorker(QThread):
     def run(self):
         try:
             y0, y1, x0, x1 = self.bbox
-            dapi = read_ome_region(self.run.dapi_ome, y0, y1, x0, x1, self.stride)
-            mask = read_ome_region(self.run.mask_ome, y0, y1, x0, x1, self.stride)
+            global_bbox = self._global_bbox(y0, y1, x0, x1)
+            print(f"[Viewer{self.viewer_id}] crop bbox={[y0, y1, x0, x1]}")
+            print(f"[Viewer{self.viewer_id}] global bbox={global_bbox}")
+            tile_infos = self._tile_infos()
+            if tile_infos and not (os.path.exists(self.run.dapi_ome) and os.path.exists(self.run.mask_ome)):
+                dapi, mask = self._read_stitched_tiles((y0, y1, x0, x1), tile_infos)
+            else:
+                dapi = read_ome_region(self.run.dapi_ome, y0, y1, x0, x1, self.stride)
+                mask = read_ome_region(self.run.mask_ome, y0, y1, x0, x1, self.stride)
             if dapi.shape != mask.shape:
                 h = min(dapi.shape[0], mask.shape[0])
                 w = min(dapi.shape[1], mask.shape[1])
                 dapi = dapi[:h, :w]
                 mask = mask[:h, :w]
+            mask = np.asarray(mask, dtype=np.uint32)
+            print(f"[Viewer{self.viewer_id}] image crop shape={getattr(dapi, 'shape', None)}")
+            print(f"[Viewer{self.viewer_id}] mask crop shape={getattr(mask, 'shape', None)}")
 
             fusion = read_fusion_region(getattr(self.roi, "fusion_zarr", None), y0, y1, x0, x1, self.stride)
             markers = {}
@@ -141,3 +153,70 @@ class PatchLoadWorker(QThread):
             self.loaded.emit(self.viewer_id, dapi, mask, fusion, markers, self.bbox)
         except Exception:
             self.failed.emit(self.viewer_id, traceback.format_exc())
+
+    def _global_bbox(self, y0, y1, x0, x1):
+        rb = getattr(self.roi, "bbox_fullres", None) or [0, 0, 0, 0]
+        if len(rb) != 4:
+            rb = [0, 0, 0, 0]
+        return [int(rb[0]) + y0, int(rb[0]) + y1, int(rb[2]) + x0, int(rb[2]) + x1]
+
+    def _tile_infos(self):
+        infos = []
+        for item in (self.run.meta.get("tile_stats") or []):
+            bbox = item.get("bbox_local")
+            if not bbox:
+                continue
+            dapi_path = item.get("dapi_path")
+            mask_path = item.get("mask_path")
+            if dapi_path and not os.path.isabs(dapi_path):
+                dapi_path = os.path.join(self.run.run_dir, dapi_path)
+            if mask_path and not os.path.isabs(mask_path):
+                mask_path = os.path.join(self.run.run_dir, mask_path)
+            infos.append(
+                {
+                    "row": item.get("row"),
+                    "col": item.get("col"),
+                    "bbox_local": [int(v) for v in bbox],
+                    "dapi_path": dapi_path,
+                    "mask_path": mask_path,
+                }
+            )
+        return infos
+
+    def _read_stitched_tiles(self, patch_roi, tile_infos):
+        py0, py1, px0, px1 = patch_roi
+        ph, pw = py1 - py0, px1 - px0
+        if ph <= 0 or pw <= 0:
+            raise ValueError("Patch outside ROI.")
+        dapi_canvas = None
+        mask_canvas = None
+        hits = []
+        for tile in tile_infos:
+            ty0, ty1, tx0, tx1 = [int(v) for v in tile["bbox_local"]]
+            iy0 = max(py0, ty0)
+            iy1 = min(py1, ty1)
+            ix0 = max(px0, tx0)
+            ix1 = min(px1, tx1)
+            if iy1 <= iy0 or ix1 <= ix0:
+                continue
+            if not tile.get("dapi_path") or not tile.get("mask_path"):
+                continue
+            dapi_crop = read_ome_region(tile["dapi_path"], iy0 - ty0, iy1 - ty0, ix0 - tx0, ix1 - tx0, 1)
+            mask_crop = read_ome_region(tile["mask_path"], iy0 - ty0, iy1 - ty0, ix0 - tx0, ix1 - tx0, 1)
+            if dapi_canvas is None:
+                dapi_canvas = np.zeros((ph, pw), dtype=dapi_crop.dtype)
+                mask_canvas = np.zeros((ph, pw), dtype=np.uint32)
+            dy0, dy1 = iy0 - py0, iy1 - py0
+            dx0, dx1 = ix0 - px0, ix1 - px0
+            dapi_canvas[dy0:dy1, dx0:dx1] = dapi_crop
+            mask_canvas[dy0:dy1, dx0:dx1] = mask_crop.astype(np.uint32)
+            hits.append(tile)
+        if dapi_canvas is None or mask_canvas is None:
+            raise ValueError("Patch outside ROI tiles.")
+        if self.stride > 1:
+            dapi_canvas = dapi_canvas[::self.stride, ::self.stride]
+            mask_canvas = mask_canvas[::self.stride, ::self.stride]
+        print(f"[Viewer{self.viewer_id}] patch intersects n_tiles={len(hits)}")
+        for tile in hits:
+            print(f"[Viewer{self.viewer_id}] using tile r={tile.get('row')} c={tile.get('col')} bbox={tile.get('bbox_local')}")
+        return dapi_canvas, mask_canvas

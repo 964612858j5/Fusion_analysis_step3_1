@@ -154,6 +154,9 @@ def read_raw_ome_channel_region(raw_ome, channel_name, global_bbox, stride=1):
 def normalize_u8(arr, p_low=1.0, p_high=99.5):
     a = np.asarray(arr, dtype=np.float32)
     finite = a[np.isfinite(a)]
+    nonzero = finite[finite > 0]
+    if nonzero.size > 100:
+        finite = nonzero
     if finite.size == 0:
         return np.zeros(a.shape, dtype=np.uint8)
     lo, hi = np.percentile(finite, [p_low, p_high])
@@ -233,10 +236,10 @@ def mask_outline(mask):
         pass
     fg = m > 0
     out = np.zeros(fg.shape, dtype=bool)
-    out[1:, :] |= fg[1:, :] != fg[:-1, :]
-    out[:-1, :] |= fg[1:, :] != fg[:-1, :]
-    out[:, 1:] |= fg[:, 1:] != fg[:, :-1]
-    out[:, :-1] |= fg[:, 1:] != fg[:, :-1]
+    out[1:, :] |= (m[1:, :] != m[:-1, :]) & fg[1:, :]
+    out[:-1, :] |= (m[:-1, :] != m[1:, :]) & fg[:-1, :]
+    out[:, 1:] |= (m[:, 1:] != m[:, :-1]) & fg[:, 1:]
+    out[:, :-1] |= (m[:, :-1] != m[:, 1:]) & fg[:, :-1]
     return out
 
 

@@ -47,7 +47,7 @@ class Step31ComparePage(QWidget):
         self._sync_enabled = True
         self._selected_viewer = "A"
         self._outline_width = OUTLINE_WIDTH_OPTIONS[DEFAULT_OUTLINE_WIDTH_INDEX]
-        self._mask_alpha = 0.0
+        self._mask_alpha = 0.35
         self._dapi_intensity = 1.0
         self._show_dapi = True
         self._show_fusion = False
@@ -55,6 +55,7 @@ class Step31ComparePage(QWidget):
         self._fusion_color = "#ff3333"
         self._preview_roi = None
         self._preview_stride = 1
+        self._loading_runs = set()
         self._outline_colors = {
             key: self._hex_to_rgb(value) for key, value in VIEWER_COLORS.items()
         }
@@ -185,7 +186,7 @@ class Step31ComparePage(QWidget):
         view_lay.addWidget(QLabel("Mask alpha:"))
         self.alpha_slider = QSlider(Qt.Horizontal)
         self.alpha_slider.setRange(0, 80)
-        self.alpha_slider.setValue(0)
+        self.alpha_slider.setValue(35)
         self.alpha_slider.setFixedWidth(100)
         self.alpha_slider.valueChanged.connect(self._update_display_controls)
         view_lay.addWidget(self.alpha_slider)
@@ -281,6 +282,7 @@ class Step31ComparePage(QWidget):
         for viewer_id in ("A", "B", "C", "D"):
             run_row.addWidget(QLabel(f"Viewer {viewer_id}:"))
             combo = QComboBox()
+            combo.currentIndexChanged.connect(self._on_run_selection_changed)
             self.run_combos[viewer_id] = combo
             run_row.addWidget(combo, stretch=1)
         run_lay.addLayout(run_row)
@@ -337,8 +339,9 @@ class Step31ComparePage(QWidget):
         self._rebuild_channel_controls()
         self._run_by_id = {run.run_id: run for run in self._runs}
         print(f"[Step3.1] selected roi_id={roi.roi_id}")
-        print(f"[Step3.1] available runs={len(self._runs)}")
+        print(f"[Step3.1] discovered result count={len(self._runs)}")
         for combo in self.run_combos.values():
+            combo.blockSignals(True)
             combo.clear()
             combo.addItem("(none)", None)
             for run in self._runs:
@@ -346,8 +349,11 @@ class Step31ComparePage(QWidget):
         for i, viewer_id in enumerate(("A", "B", "C", "D"), start=0):
             if i + 1 < self.run_combos[viewer_id].count():
                 self.run_combos[viewer_id].setCurrentIndex(i + 1)
+        for combo in self.run_combos.values():
+            combo.blockSignals(False)
         fusion_status = "Fusion available" if roi.fusion_zarr else "Fusion fallback to DAPI"
         self.status.setText(f"{roi.display_name}: {len(self._runs)} segmentation run(s). {fusion_status}.")
+        self._load_selected_runs()
 
     def _load_selected_runs(self):
         if self._loader is None or self.project_edit.text().strip() != self._project_dir:
@@ -357,6 +363,8 @@ class Step31ComparePage(QWidget):
             QMessageBox.warning(self, "Step3.1", "Select a ROI first.")
             return
         self._selected_runs = {}
+        self._loading_runs = set()
+        selected = []
         for viewer_id, combo in self.run_combos.items():
             run_id = combo.currentData()
             if not run_id:
@@ -368,7 +376,17 @@ class Step31ComparePage(QWidget):
             if run.roi_id != roi.roi_id:
                 QMessageBox.warning(self, "Step3.1", "Selected runs must belong to the same ROI.")
                 return
+            selected.append((viewer_id, run))
+        print(f"[Step3.1] selected result count={len(selected)}")
+        for viewer_id, run in selected:
+            print(f"[Step3.1] viewer slot {viewer_id} -> result name={run.display_name} method={run.method}")
+            print(f"[Step3.1] viewer slot {viewer_id} -> mask path={run.mask_ome}")
             self._start_run_load(viewer_id, run)
+
+    def _on_run_selection_changed(self, *_args):
+        if not hasattr(self, "run_combos"):
+            return
+        self._load_selected_runs()
 
     def _start_run_load(self, viewer_id, run):
         if not os.path.exists(run.dapi_ome) or not os.path.exists(run.mask_ome):
@@ -381,12 +399,13 @@ class Step31ComparePage(QWidget):
         label = f"{run.display_name}\n{run.created_at}"
         if run.cell_count is not None:
             label += f"\ncells={run.cell_count:,}"
-            self.viewers[viewer_id].set_run_label(label + "\nloading overview...")
+        self.viewers[viewer_id].set_run_label(label + "\nloading overview...")
         print(f"[Viewer{viewer_id}] run_id={run.run_id}")
         print(f"[Viewer{viewer_id}] method={run.method}")
         print(f"[Viewer{viewer_id}] dapi={run.dapi_ome}")
         print(f"[Viewer{viewer_id}] mask={run.mask_ome}")
         roi = self.roi_combo.currentData()
+        self._loading_runs.add(viewer_id)
         worker = RunLoadWorker(viewer_id, run.dapi_ome, run.mask_ome, roi=roi, channels=[], parent=self)
         worker.loaded.connect(lambda vid, dapi, mask, stride, overlays, r=run, label=label: self._on_run_loaded(vid, r, label, dapi, mask, stride, overlays))
         worker.failed.connect(self._on_run_failed)
@@ -395,6 +414,7 @@ class Step31ComparePage(QWidget):
 
     def _on_run_loaded(self, viewer_id, run, label, dapi, mask, stride, overlays):
         self._selected_runs[viewer_id] = run
+        self._loading_runs.discard(viewer_id)
         self.viewers[viewer_id].set_run_label(label + "\nDraw patch on preview")
         if viewer_id == "A" or self.preview._dapi is None:
             self._preview_stride = stride
@@ -415,6 +435,7 @@ class Step31ComparePage(QWidget):
         ]
         self.viewers[viewer_id].set_run_label(self._viewer_label(run) + "\nloading patch...")
         print(f"[Viewer{viewer_id}] patch local bbox={list(bbox)}")
+        print(f"[Step3.1] crop bbox={list(bbox)}")
         worker = PatchLoadWorker(viewer_id, run, roi, bbox, channels=visible_channels, stride=1, parent=self)
         worker.loaded.connect(lambda vid, dapi, mask, fusion, markers, b, r=run: self._on_patch_loaded(vid, r, dapi, mask, fusion, markers, b))
         worker.failed.connect(self._on_run_failed)
@@ -440,11 +461,17 @@ class Step31ComparePage(QWidget):
         self.viewers[viewer_id].set_data(dapi, mask, 1)
         self.viewers[viewer_id].set_overlay_data(fusion=fusion, markers=markers)
         self._update_display_controls()
+        print(f"[Step3.1] viewer slot {viewer_id} -> result name={run.display_name} method={run.method}")
+        print(f"[Step3.1] viewer slot {viewer_id} -> mask path={run.mask_ome}")
+        print(f"[Step3.1] viewer slot {viewer_id} -> mask shape={getattr(mask, 'shape', None)}")
+        print(f"[Step3.1] image crop shape={getattr(dapi, 'shape', None)}")
+        print(f"[Step3.1] mask crop shape={getattr(mask, 'shape', None)}")
         y0, y1, x0, x1 = bbox
         self.status.setText(f"Patch loaded: y={y0}:{y1} x={x0}:{x1}")
 
     def _on_run_failed(self, viewer_id, error):
         self.viewers[viewer_id].set_run_label(f"Viewer {viewer_id}\nLoad failed")
+        self._loading_runs.discard(viewer_id)
         print(f"[Viewer{viewer_id}] load failed:\n{error}")
         QMessageBox.warning(self, "Step3.1", f"Viewer {viewer_id} failed to load.\n\n{error[:1200]}")
 
@@ -523,7 +550,15 @@ class Step31ComparePage(QWidget):
         else:
             y0, y1, x0, x1 = bounds
             self.status.setText(f"ROI y={y0}:{y1} x={x0}:{x1}")
-            print(f"[Step3.1] patch bbox local={[y0, y1, x0, x1]}")
+            roi = self.roi_combo.currentData()
+            rb = getattr(roi, "bbox_fullres", None) or [0, 0, 0, 0]
+            global_bbox = (
+                [int(rb[0]) + y0, int(rb[0]) + y1, int(rb[2]) + x0, int(rb[2]) + x1]
+                if len(rb) == 4 else [y0, y1, x0, x1]
+            )
+            print(f"[Step3.1] ROI-space bbox={[y0, y1, x0, x1]}")
+            print(f"[Step3.1] global bbox={global_bbox}")
+            print(f"[Step3.1] crop bbox={[y0, y1, x0, x1]}")
             for viewer_id, run in self._selected_runs.items():
                 self._start_patch_load(viewer_id, run, bounds)
 

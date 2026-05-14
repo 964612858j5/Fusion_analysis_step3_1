@@ -1,5 +1,6 @@
 """V7-style preview viewer with a draggable ROI rectangle."""
 
+import math
 import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -46,6 +47,8 @@ class OverviewViewer(QWidget):
 
     def set_roi(self, bounds):
         self._roi = self._full_to_preview(bounds)
+        print(f"[Step3.1] preview rect={self._roi}")
+        print(f"[Step3.1] ROI-space bbox={bounds}")
         self._draw_roi()
         self.roi_changed.emit(bounds)
 
@@ -104,7 +107,14 @@ class OverviewViewer(QWidget):
         self._roi = (y0, y1, x0, x1)
         self._draw_roi()
         if emit:
-            self.roi_changed.emit(self._preview_to_full(self._roi))
+            full = self._preview_to_full(self._roi)
+            print(f"[Step3.1] preview rect={self._roi}")
+            print(
+                "[Step3.1] normalized rect="
+                f"{(y0 / self._dapi.shape[0], y1 / self._dapi.shape[0], x0 / self._dapi.shape[1], x1 / self._dapi.shape[1])}"
+            )
+            print(f"[Step3.1] ROI-space bbox={full}")
+            self.roi_changed.emit(full)
 
     def _draw_roi(self):
         if self._roi is None:
@@ -124,11 +134,23 @@ class OverviewViewer(QWidget):
             return None
         y0, y1, x0, x1 = [int(v) for v in bounds]
         s = self._stride
-        return (y0 * s, y1 * s, x0 * s, x1 * s)
+        full_h = int(self._dapi.shape[0]) * s if self._dapi is not None else y1 * s
+        full_w = int(self._dapi.shape[1]) * s if self._dapi is not None else x1 * s
+        return (
+            max(0, y0 * s),
+            min(full_h, int(math.ceil(y1 * s))),
+            max(0, x0 * s),
+            min(full_w, int(math.ceil(x1 * s))),
+        )
 
     def _full_to_preview(self, bounds):
         if bounds is None:
             return None
         y0, y1, x0, x1 = [int(v) for v in bounds]
         s = self._stride
-        return (y0 // s, max(y0 // s + 1, y1 // s), x0 // s, max(x0 // s + 1, x1 // s))
+        return (
+            y0 // s,
+            max(y0 // s + 1, int(math.ceil(y1 / float(s)))),
+            x0 // s,
+            max(x0 // s + 1, int(math.ceil(x1 / float(s)))),
+        )
