@@ -1,6 +1,7 @@
 """Step3.1 standalone multi-method segmentation comparator."""
 
 import os
+import re
 
 import numpy as np
 from PyQt5 import QtGui, QtWidgets
@@ -349,14 +350,21 @@ class Step31ComparePage(QWidget):
 
     def _make_viewer_grid(self):
         grid_w = QWidget()
+        grid_w.setMinimumSize(0, 0)
+        grid_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         grid = QGridLayout(grid_w)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(4)
+        grid.setColumnMinimumWidth(0, 0)
+        grid.setColumnMinimumWidth(1, 0)
+        grid.setRowMinimumHeight(0, 0)
+        grid.setRowMinimumHeight(1, 0)
         self.viewers = {}
         positions = {"A": (0, 0), "B": (0, 1), "C": (1, 0), "D": (1, 1)}
         for viewer_id, pos in positions.items():
             viewer = CompareViewer(viewer_id, self._outline_colors[viewer_id])
             viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            viewer.setMinimumSize(0, 0)
             viewer.view_changed.connect(self._on_view_changed)
             viewer.selected.connect(self._on_viewer_selected)
             self.viewers[viewer_id] = viewer
@@ -434,7 +442,7 @@ class Step31ComparePage(QWidget):
         for viewer_id, combo in self.run_combos.items():
             run_id = combo.currentData()
             if not run_id:
-                self.viewers[viewer_id].set_run_label(f"Viewer {viewer_id}: No run selected")
+                self.viewers[viewer_id].set_header(f"Viewer {viewer_id}", "No result loaded", f"Viewer {viewer_id}: No result loaded")
                 continue
             run = self._run_by_id.get(run_id)
             if run is None:
@@ -466,7 +474,7 @@ class Step31ComparePage(QWidget):
         if run.cell_count is not None:
             label += f"\ncells={run.cell_count:,}"
         self._ensure_viewer_name(viewer_id, run)
-        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run, "loading overview"))
+        self._set_viewer_header(viewer_id, run)
         print(f"[Viewer{viewer_id}] run_id={run.run_id}")
         print(f"[Viewer{viewer_id}] method={run.method}")
         print(f"[Viewer{viewer_id}] dapi={run.dapi_ome}")
@@ -483,7 +491,7 @@ class Step31ComparePage(QWidget):
         self._selected_runs[viewer_id] = run
         self._loading_runs.discard(viewer_id)
         self._ensure_viewer_name(viewer_id, run)
-        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run, "draw patch"))
+        self._set_viewer_header(viewer_id, run)
         if viewer_id == "A" or self.preview._dapi is None:
             self._preview_stride = stride
             self.preview.set_data(dapi, stride=stride)
@@ -496,7 +504,7 @@ class Step31ComparePage(QWidget):
         roi = self.roi_combo.currentData()
         if roi is None or bbox is None:
             return
-        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run, "loading patch"))
+        self._set_viewer_header(viewer_id, run)
         print(f"[Viewer{viewer_id}] patch local bbox={list(bbox)}")
         print(f"[Step3.1] crop bbox={list(bbox)}")
         worker = PatchLoadWorker(viewer_id, run, roi, bbox, channels=[], stride=1, parent=self)
@@ -518,6 +526,96 @@ class Step31ComparePage(QWidget):
         if run.cell_count is not None:
             label += f"\ncells={run.cell_count:,}"
         return label
+
+    def format_result_header(self, run):
+        method_id = self._core_method_id(run)
+        time_id = self._run_time_id(run)
+        title_line = f"{method_id} | {time_id}" if time_id else method_id
+        params = self._result_params(run)
+        param_line = self._format_param_summary(params)
+        if not param_line:
+            param_line = "No key parameters"
+        tooltip = "\n".join(
+            [
+                f"title: {title_line}",
+                f"display_name: {run.display_name}",
+                f"method: {run.method}",
+                f"run_id: {run.run_id}",
+                f"created_at: {run.created_at}",
+                f"mask: {run.mask_ome}",
+                f"params: {params}",
+            ]
+        )
+        return title_line, param_line, tooltip
+
+    def _set_viewer_header(self, viewer_id, run):
+        title_line, param_line, tooltip = self.format_result_header(run)
+        self.viewers[viewer_id].set_header(title_line, param_line, tooltip)
+
+    def _core_method_id(self, run):
+        method = str(run.method or "").strip()
+        if method and method.lower() not in {"unknown", "none"}:
+            return method
+        rid = str(run.run_id or os.path.basename(run.run_dir or "")).strip()
+        m = re.search(r"(?:seg_)?\d{8}[_-]\d{6}[_-](.+)$", rid)
+        if m:
+            return m.group(1)
+        m = re.search(r"\d{4}-\d{2}-\d{2}[_T -]\d{2}:?\d{2}:?\d{2}[_-](.+)$", rid)
+        if m:
+            return m.group(1)
+        return rid or str(run.display_name or "segmentation_result")
+
+    def _run_time_id(self, run):
+        for value in (run.run_id, run.created_at, os.path.basename(run.run_dir or "")):
+            text = str(value or "")
+            m = re.search(r"(\d{8})[_-](\d{6})", text)
+            if m:
+                d, t = m.groups()
+                return f"{d[:4]}-{d[4:6]}-{d[6:8]}_{t}"
+            m = re.search(r"(\d{4}-\d{2}-\d{2})[T_ -](\d{2}):?(\d{2}):?(\d{2})", text)
+            if m:
+                return f"{m.group(1)}_{m.group(2)}{m.group(3)}{m.group(4)}"
+        return str(run.run_id or run.created_at or "")[:24]
+
+    def _result_params(self, run):
+        params = {}
+        for source in (
+            (run.meta.get("seg_config") or {}).get("params"),
+            run.meta.get("params"),
+            run.meta.get("segmentation_params"),
+            run.meta,
+        ):
+            if isinstance(source, dict):
+                params.update(source)
+        return params
+
+    def _format_param_summary(self, params):
+        if not isinstance(params, dict) or not params:
+            return ""
+        bits = []
+        if "diameter" in params:
+            bits.append(f"diameter={params.get('diameter')}")
+        if "cellprob_threshold" in params:
+            bits.append(f"cellprob={params.get('cellprob_threshold')}")
+        elif "cellprob" in params:
+            bits.append(f"cellprob={params.get('cellprob')}")
+        if "flow_threshold" in params:
+            bits.append(f"flow={params.get('flow_threshold')}")
+        elif "flow" in params:
+            bits.append(f"flow={params.get('flow')}")
+        for key in ("model", "model_name"):
+            if key in params:
+                bits.append(f"model={params.get(key)}")
+                break
+        if "prob_thresh" in params:
+            bits.append(f"prob_thresh={params.get('prob_thresh')}")
+        if "nms_thresh" in params:
+            bits.append(f"nms_thresh={params.get('nms_thresh')}")
+        if "expand_distance" in params:
+            bits.append(f"expansion={params.get('expand_distance')} px")
+        elif "expansion" in params:
+            bits.append(f"expansion={params.get('expansion')} px")
+        return ", ".join(bits[:4])
 
     def _viewer_name(self, viewer_id):
         return self._viewer_names.get(viewer_id) or f"Viewer {viewer_id}"
@@ -550,9 +648,9 @@ class Step31ComparePage(QWidget):
         self._viewer_auto_names.discard(viewer_id)
         run = self._selected_runs.get(viewer_id)
         if run is not None:
-            self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run))
+            self._set_viewer_header(viewer_id, run)
         else:
-            self.viewers[viewer_id].set_run_label(f"{self._viewer_name(viewer_id)} | No run selected")
+            self.viewers[viewer_id].set_header(f"Viewer {viewer_id}", "No result loaded", self._viewer_name(viewer_id))
 
     def _choose_viewer_color(self, viewer_id):
         cur = QtGui.QColor(*self._outline_colors[viewer_id])
@@ -571,7 +669,7 @@ class Step31ComparePage(QWidget):
         btn.setStyleSheet(f"background:{color};border:1px solid #777;")
 
     def _on_patch_loaded(self, viewer_id, run, dapi, mask, fusion, markers, bbox):
-        self.viewers[viewer_id].set_run_label(self._viewer_title_text(viewer_id, run))
+        self._set_viewer_header(viewer_id, run)
         self.viewers[viewer_id].set_data(dapi, mask, 1)
         self.viewers[viewer_id].set_overlay_data(fusion=fusion, markers={})
         self._shared_dapi = np.asarray(dapi)
@@ -588,7 +686,7 @@ class Step31ComparePage(QWidget):
         self.status.setText(f"Patch loaded: y={y0}:{y1} x={x0}:{x1}")
 
     def _on_run_failed(self, viewer_id, error):
-        self.viewers[viewer_id].set_run_label(f"{self._viewer_name(viewer_id)} | Load failed")
+        self.viewers[viewer_id].set_header(f"Viewer {viewer_id}", "Load failed", error[:1200])
         self._loading_runs.discard(viewer_id)
         print(f"[Viewer{viewer_id}] load failed:\n{error}")
         QMessageBox.warning(self, "Step3.1", f"Viewer {viewer_id} failed to load.\n\n{error[:1200]}")

@@ -24,6 +24,8 @@ class CompareViewer(QWidget):
             f"QWidget#compareViewer{viewer_id}{{border:1px solid {border_hex};"
             "border-radius:5px;background:#101010;}"
         )
+        self.setMinimumSize(0, 0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._sync_guard = False
         self._dapi = None
         self._mask = None
@@ -45,19 +47,39 @@ class CompareViewer(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(2)
-        self.title = QLabel(f"Viewer {viewer_id}: No run selected")
-        self.title.setStyleSheet(
+
+        self.header = QWidget()
+        self.header.setFixedHeight(44)
+        self.header.setMinimumWidth(0)
+        self.header.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.header.setStyleSheet("background:#1a1a1a;")
+        header_lay = QVBoxLayout(self.header)
+        header_lay.setContentsMargins(4, 3, 4, 3)
+        header_lay.setSpacing(0)
+        self.title = QLabel("")
+        self.subtitle = QLabel("")
+        for lbl, size, weight in ((self.title, 11, "bold"), (self.subtitle, 10, "normal")):
+            lbl.setWordWrap(False)
+            lbl.setMinimumWidth(0)
+            lbl.setFixedHeight(18)
+            lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            lbl.setStyleSheet(
+                f"color:rgb({outline_color[0]},{outline_color[1]},{outline_color[2]});"
+                f"background:#1a1a1a;font-size:{size}px;font-weight:{weight};"
+            )
+            header_lay.addWidget(lbl)
+        lay.addWidget(self.header)
+        self.set_header(f"Viewer {viewer_id}", "No result loaded", f"Viewer {viewer_id}: No result loaded")
+
+        self._title_style = (
             f"color:rgb({outline_color[0]},{outline_color[1]},{outline_color[2]});"
-            "background:#1a1a1a;padding:4px;font-size:11px;font-weight:bold;"
+            "background:#1a1a1a;"
         )
-        self.title.setWordWrap(False)
-        self.title.setFixedHeight(30)
-        self.title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        self.title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        lay.addWidget(self.title)
 
         self.canvas = pg.GraphicsLayoutWidget()
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setMinimumSize(0, 0)
         self.canvas.setBackground("#060606")
         self.view = self.canvas.addViewBox()
         self.view.setAspectLocked(True)
@@ -74,19 +96,28 @@ class CompareViewer(QWidget):
         lay.addWidget(self.canvas, stretch=1)
 
     def set_run_label(self, text):
-        full = str(text or "")
-        self.title.setToolTip(full)
-        self.title.setText(self._elide(full))
+        lines = str(text or "").splitlines()
+        title = lines[0] if lines else ""
+        subtitle = lines[1] if len(lines) > 1 else ""
+        self.set_header(title, subtitle, str(text or ""))
 
-    def _elide(self, text):
-        one_line = " | ".join(str(text).splitlines())
-        metrics = self.title.fontMetrics()
-        width = max(40, self.title.width() - 10)
-        return metrics.elidedText(one_line, Qt.ElideRight, width)
+    def set_header(self, title_line, param_line="", tooltip=""):
+        self._title_line = str(title_line or "")
+        self._param_line = str(param_line or "")
+        self._tooltip = str(tooltip or "\n".join([self._title_line, self._param_line]).strip())
+        self.header.setToolTip(self._tooltip)
+        self.title.setToolTip(self._tooltip)
+        self.subtitle.setToolTip(self._tooltip)
+        self._refresh_elided_header()
+
+    def _refresh_elided_header(self):
+        width = max(40, self.header.width() - 10)
+        self.title.setText(self.title.fontMetrics().elidedText(self._title_line, Qt.ElideRight, width))
+        self.subtitle.setText(self.subtitle.fontMetrics().elidedText(self._param_line, Qt.ElideRight, width))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.set_run_label(self.title.toolTip() or self.title.text())
+        self._refresh_elided_header()
 
     def set_data(self, dapi, mask, stride):
         self._dapi = np.asarray(dapi)
@@ -142,7 +173,11 @@ class CompareViewer(QWidget):
         )
         self.title.setStyleSheet(
             f"color:rgb({color[0]},{color[1]},{color[2]});"
-            "background:#1a1a1a;padding:4px;font-size:11px;font-weight:bold;"
+            "background:#1a1a1a;font-size:11px;font-weight:bold;"
+        )
+        self.subtitle.setStyleSheet(
+            f"color:rgb({color[0]},{color[1]},{color[2]});"
+            "background:#1a1a1a;font-size:10px;font-weight:normal;"
         )
         self.render()
 
