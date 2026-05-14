@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -26,7 +27,7 @@ from configs.defaults import OUTLINE_WIDTH_OPTIONS, DEFAULT_OUTLINE_WIDTH_INDEX
 from loaders.project_loader import ProjectLoader
 from ui.compare_viewer import CompareViewer
 from ui.overview_viewer import OverviewViewer
-from workers.compare_loader import RunLoadWorker
+from workers.compare_loader import PatchLoadWorker, RunLoadWorker
 
 
 class Step31ComparePage(QWidget):
@@ -41,6 +42,7 @@ class Step31ComparePage(QWidget):
         self._channels = []
         self._channel_settings = {}
         self._workers = {}
+        self._selected_runs = {}
         self._sync_enabled = True
         self._selected_viewer = "A"
         self._outline_width = OUTLINE_WIDTH_OPTIONS[DEFAULT_OUTLINE_WIDTH_INDEX]
@@ -49,6 +51,7 @@ class Step31ComparePage(QWidget):
         self._show_dapi = True
         self._show_fusion = False
         self._preview_roi = None
+        self._preview_stride = 1
         self._outline_colors = {
             key: self._hex_to_rgb(value) for key, value in VIEWER_COLORS.items()
         }
@@ -178,6 +181,14 @@ class Step31ComparePage(QWidget):
         self.dapi_slider.valueChanged.connect(self._update_display_controls)
         dapi_row.addWidget(self.dapi_slider)
         display_lay.addLayout(dapi_row)
+        fusion_row = QHBoxLayout()
+        fusion_row.addWidget(QLabel("Fusion intensity:"))
+        self.fusion_slider = QSlider(Qt.Horizontal)
+        self.fusion_slider.setRange(10, 300)
+        self.fusion_slider.setValue(100)
+        self.fusion_slider.valueChanged.connect(self._update_display_controls)
+        fusion_row.addWidget(self.fusion_slider)
+        display_lay.addLayout(fusion_row)
         lay.addWidget(display_box)
 
         self.channel_box = QGroupBox("Marker Channels")
@@ -266,6 +277,7 @@ class Step31ComparePage(QWidget):
         if roi is None:
             QMessageBox.warning(self, "Step3.1", "Select a ROI first.")
             return
+        self._selected_runs = {}
         for viewer_id, combo in self.run_combos.items():
             run_id = combo.currentData()
             if not run_id:
@@ -290,31 +302,67 @@ class Step31ComparePage(QWidget):
         label = f"{run.display_name}\n{run.created_at}"
         if run.cell_count is not None:
             label += f"\ncells={run.cell_count:,}"
-        self.viewers[viewer_id].set_run_label(label + "\nloading...")
+            self.viewers[viewer_id].set_run_label(label + "\nloading overview...")
         print(f"[Viewer{viewer_id}] run_id={run.run_id}")
         print(f"[Viewer{viewer_id}] method={run.method}")
         print(f"[Viewer{viewer_id}] dapi={run.dapi_ome}")
         print(f"[Viewer{viewer_id}] mask={run.mask_ome}")
         roi = self.roi_combo.currentData()
-        worker = RunLoadWorker(viewer_id, run.dapi_ome, run.mask_ome, roi=roi, channels=self._channels, parent=self)
+        worker = RunLoadWorker(viewer_id, run.dapi_ome, run.mask_ome, roi=roi, channels=[], parent=self)
         worker.loaded.connect(lambda vid, dapi, mask, stride, overlays, r=run, label=label: self._on_run_loaded(vid, r, label, dapi, mask, stride, overlays))
         worker.failed.connect(self._on_run_failed)
         self._workers[viewer_id] = worker
         worker.start()
 
     def _on_run_loaded(self, viewer_id, run, label, dapi, mask, stride, overlays):
-        self.viewers[viewer_id].set_run_label(label)
-        self.viewers[viewer_id].set_data(dapi, mask, stride)
-        self.viewers[viewer_id].set_overlay_data(
-            fusion=(overlays or {}).get("fusion"),
-            markers=(overlays or {}).get("markers", {}),
-        )
+        self._selected_runs[viewer_id] = run
+        self.viewers[viewer_id].set_run_label(label + "\nDraw patch on preview")
         if viewer_id == "A" or self.preview._dapi is None:
-            self.preview.set_data(dapi)
+            self._preview_stride = stride
+            self.preview.set_data(dapi, stride=stride)
         if self._preview_roi is not None:
-            self.viewers[viewer_id].set_roi_bounds(self._preview_roi)
+            self._start_patch_load(viewer_id, run, self._preview_roi)
         self._update_display_controls()
-        self.status.setText(f"Loaded {viewer_id}: {run.run_id}")
+        self.status.setText(f"Loaded overview {viewer_id}: {run.run_id}. Draw a patch to inspect.")
+
+    def _start_patch_load(self, viewer_id, run, bbox):
+        roi = self.roi_combo.currentData()
+        if roi is None or bbox is None:
+            return
+        visible_channels = [
+            ch for ch in self._channels
+            if self._channel_settings.get(ch.name, {}).get("check")
+            and self._channel_settings[ch.name]["check"].isChecked()
+        ]
+        self.viewers[viewer_id].set_run_label(self._viewer_label(run) + "\nloading patch...")
+        print(f"[Viewer{viewer_id}] patch local bbox={list(bbox)}")
+        worker = PatchLoadWorker(viewer_id, run, roi, bbox, channels=visible_channels, stride=1, parent=self)
+        worker.loaded.connect(lambda vid, dapi, mask, fusion, markers, b, r=run: self._on_patch_loaded(vid, r, dapi, mask, fusion, markers, b))
+        worker.failed.connect(self._on_run_failed)
+        self._workers[f"patch_{viewer_id}"] = worker
+        worker.start()
+
+    def _viewer_label(self, run):
+        label = f"{run.display_name}\n{run.created_at}"
+        params = ((run.meta.get("seg_config") or {}).get("params") or run.meta.get("params") or {})
+        if params:
+            bits = []
+            for key in ("diameter", "flow_threshold", "cellprob_threshold", "prob_thresh", "nms_thresh", "expand_distance"):
+                if key in params:
+                    bits.append(f"{key}={params.get(key)}")
+            if bits:
+                label += "\n" + ", ".join(bits[:3])
+        if run.cell_count is not None:
+            label += f"\ncells={run.cell_count:,}"
+        return label
+
+    def _on_patch_loaded(self, viewer_id, run, dapi, mask, fusion, markers, bbox):
+        self.viewers[viewer_id].set_run_label(self._viewer_label(run))
+        self.viewers[viewer_id].set_data(dapi, mask, 1)
+        self.viewers[viewer_id].set_overlay_data(fusion=fusion, markers=markers)
+        self._update_display_controls()
+        y0, y1, x0, x1 = bbox
+        self.status.setText(f"Patch loaded: y={y0}:{y1} x={x0}:{x1}")
 
     def _on_run_failed(self, viewer_id, error):
         self.viewers[viewer_id].set_run_label(f"Viewer {viewer_id}\nLoad failed")
@@ -352,6 +400,7 @@ class Step31ComparePage(QWidget):
         dapi_intensity = self.dapi_slider.value() / 100.0
         mask_alpha = self.alpha_slider.value() / 100.0
         channel_settings = self._current_channel_settings()
+        channel_settings["__fusion__"] = {"intensity": self.fusion_slider.value() / 100.0}
         for viewer in self.viewers.values():
             viewer.set_display(
                 show_outline=show_outline,
@@ -362,6 +411,12 @@ class Step31ComparePage(QWidget):
                 show_fusion=self.fusion_chk.isChecked(),
                 channel_settings=channel_settings,
             )
+
+    def _on_channel_controls_changed(self):
+        self._update_display_controls()
+        if self._preview_roi is not None:
+            for viewer_id, run in self._selected_runs.items():
+                self._start_patch_load(viewer_id, run, self._preview_roi)
 
     def _choose_current_color(self):
         cur = QtGui.QColor(*self._outline_colors[self._selected_viewer])
@@ -378,13 +433,14 @@ class Step31ComparePage(QWidget):
 
     def _on_preview_roi_changed(self, bounds):
         self._preview_roi = bounds
-        for viewer in self.viewers.values():
-            viewer.set_roi_bounds(bounds)
         if bounds is None:
             self.status.setText("ROI cleared")
         else:
             y0, y1, x0, x1 = bounds
             self.status.setText(f"ROI y={y0}:{y1} x={x0}:{x1}")
+            print(f"[Step3.1] patch bbox local={[y0, y1, x0, x1]}")
+            for viewer_id, run in self._selected_runs.items():
+                self._start_patch_load(viewer_id, run, bounds)
 
     def _rebuild_channel_controls(self):
         while self.channel_lay.count():
@@ -400,20 +456,44 @@ class Step31ComparePage(QWidget):
             row = QHBoxLayout()
             chk = QCheckBox(ch.name)
             chk.setChecked(False)
-            chk.toggled.connect(self._update_display_controls)
+            chk.toggled.connect(self._on_channel_controls_changed)
             color_btn = QPushButton()
             color_btn.setFixedWidth(24)
             color_btn.setStyleSheet(f"background:{ch.color}; border:1px solid #666;")
             alpha = QSlider(Qt.Horizontal)
             alpha.setRange(0, 100)
             alpha.setValue(int(ch.alpha * 100))
-            alpha.valueChanged.connect(self._update_display_controls)
-            self._channel_settings[ch.name] = {"check": chk, "color": ch.color, "alpha": alpha, "button": color_btn}
+            alpha.valueChanged.connect(self._on_channel_controls_changed)
+            p_low = QDoubleSpinBox()
+            p_low.setRange(0.0, 99.0)
+            p_low.setDecimals(1)
+            p_low.setSingleStep(0.5)
+            p_low.setValue(1.0)
+            p_low.setFixedWidth(56)
+            p_low.valueChanged.connect(self._on_channel_controls_changed)
+            p_high = QDoubleSpinBox()
+            p_high.setRange(1.0, 100.0)
+            p_high.setDecimals(1)
+            p_high.setSingleStep(0.5)
+            p_high.setValue(99.5)
+            p_high.setFixedWidth(64)
+            p_high.valueChanged.connect(self._on_channel_controls_changed)
+            self._channel_settings[ch.name] = {
+                "check": chk,
+                "color": ch.color,
+                "alpha": alpha,
+                "button": color_btn,
+                "p_low": p_low,
+                "p_high": p_high,
+            }
             color_btn.clicked.connect(lambda _=False, name=ch.name: self._choose_channel_color(name))
             row.addWidget(chk, stretch=2)
             row.addWidget(color_btn)
             row.addWidget(QLabel("alpha"))
             row.addWidget(alpha, stretch=1)
+            row.addWidget(QLabel("p"))
+            row.addWidget(p_low)
+            row.addWidget(p_high)
             self.channel_lay.addLayout(row)
 
     def _current_channel_settings(self):
@@ -424,8 +504,8 @@ class Step31ComparePage(QWidget):
                 "visible": widgets["check"].isChecked(),
                 "rgb": (color.red(), color.green(), color.blue()),
                 "alpha": widgets["alpha"].value() / 100.0,
-                "p_low": 1.0,
-                "p_high": 99.5,
+                "p_low": min(widgets["p_low"].value(), widgets["p_high"].value() - 0.1),
+                "p_high": max(widgets["p_high"].value(), widgets["p_low"].value() + 0.1),
             }
         return out
 
@@ -440,3 +520,6 @@ class Step31ComparePage(QWidget):
         widgets["color"] = color.name()
         widgets["button"].setStyleSheet(f"background:{color.name()}; border:1px solid #666;")
         self._update_display_controls()
+        if self._preview_roi is not None:
+            for viewer_id, run in self._selected_runs.items():
+                self._start_patch_load(viewer_id, run, self._preview_roi)

@@ -15,6 +15,7 @@ class OverviewViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._dapi = None
+        self._stride = 1
         self._roi = None
         self._drag_start = None
         self._rect_item = None
@@ -36,14 +37,15 @@ class OverviewViewer(QWidget):
         self.canvas.viewport().installEventFilter(self)
         lay.addWidget(self.canvas, stretch=1)
 
-    def set_data(self, dapi):
+    def set_data(self, dapi, stride=1):
         self._dapi = np.asarray(dapi)
+        self._stride = max(1, int(stride or 1))
         self.image_item.setImage(dapi_rgb(self._dapi), autoLevels=False)
         self.view.autoRange()
-        self.title.setText("Preview / ROI - drag to select zoom region")
+        self.title.setText("ROI preview - drag to draw QC patch")
 
     def set_roi(self, bounds):
-        self._roi = bounds
+        self._roi = self._full_to_preview(bounds)
         self._draw_roi()
         self.roi_changed.emit(bounds)
 
@@ -102,7 +104,7 @@ class OverviewViewer(QWidget):
         self._roi = (y0, y1, x0, x1)
         self._draw_roi()
         if emit:
-            self.roi_changed.emit(self._roi)
+            self.roi_changed.emit(self._preview_to_full(self._roi))
 
     def _draw_roi(self):
         if self._roi is None:
@@ -116,3 +118,17 @@ class OverviewViewer(QWidget):
             self.view.addItem(self._rect_item)
         else:
             self._rect_item.setRect(rect)
+
+    def _preview_to_full(self, bounds):
+        if bounds is None:
+            return None
+        y0, y1, x0, x1 = [int(v) for v in bounds]
+        s = self._stride
+        return (y0 * s, y1 * s, x0 * s, x1 * s)
+
+    def _full_to_preview(self, bounds):
+        if bounds is None:
+            return None
+        y0, y1, x0, x1 = [int(v) for v in bounds]
+        s = self._stride
+        return (y0 // s, max(y0 // s + 1, y1 // s), x0 // s, max(x0 // s + 1, x1 // s))

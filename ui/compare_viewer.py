@@ -23,9 +23,9 @@ class CompareViewer(QWidget):
         self._fusion = None
         self._markers = {}
         self._channel_settings = {}
-        self._roi_bounds = None
         self._stride = 1
         self._dapi_intensity = 1.0
+        self._fusion_intensity = 1.0
         self._show_outline = True
         self._outline_width = 0.5
         self._mask_alpha = 0.0
@@ -79,6 +79,8 @@ class CompareViewer(QWidget):
             self._outline_width = max(0.25, float(outline_width))
         if dapi_intensity is not None:
             self._dapi_intensity = float(dapi_intensity)
+        if channel_settings is not None and "__fusion__" in channel_settings:
+            self._fusion_intensity = float(channel_settings["__fusion__"].get("intensity", self._fusion_intensity))
         if mask_alpha is not None:
             self._mask_alpha = float(mask_alpha)
         if show_dapi is not None:
@@ -90,9 +92,10 @@ class CompareViewer(QWidget):
         self.render()
 
     def set_roi_bounds(self, bounds):
-        self._roi_bounds = bounds
-        self.render()
-        self.reset_view()
+        # Retained for API compatibility with the old prototype.  Step3.1 now
+        # reloads the actual high-resolution patch instead of cropping overview
+        # images in the viewer.
+        return
 
     def set_outline_color(self, color):
         self.outline_color = color
@@ -104,9 +107,9 @@ class CompareViewer(QWidget):
             self.fill_item.clear()
             self.outline_item.clear()
             return
-        dapi = self._crop(self._dapi)
-        mask = None if self._mask is None else self._crop(self._mask)
-        fusion = None if self._fusion is None else self._crop(self._fusion)
+        dapi = self._dapi
+        mask = self._mask
+        fusion = self._fusion
         marker_layers = []
         for name, arr in self._markers.items():
             st = self._channel_settings.get(name, {})
@@ -114,7 +117,7 @@ class CompareViewer(QWidget):
                 continue
             marker_layers.append(
                 {
-                    "array": self._crop(arr),
+                    "array": arr,
                     "color": st.get("rgb", (255, 255, 255)),
                     "alpha": st.get("alpha", 0.65),
                     "p_low": st.get("p_low", 1.0),
@@ -123,7 +126,9 @@ class CompareViewer(QWidget):
             )
         if marker_layers or self._show_fusion:
             rgb = compose_overlay_rgb(dapi, fusion=fusion, marker_layers=marker_layers,
-                                      dapi_visible=self._show_dapi, fusion_visible=self._show_fusion)
+                                      dapi_visible=self._show_dapi, fusion_visible=self._show_fusion,
+                                      dapi_intensity=self._dapi_intensity,
+                                      fusion_intensity=self._fusion_intensity)
         elif self._show_dapi:
             rgb = dapi_rgb(dapi, self._dapi_intensity)
         else:
@@ -137,12 +142,6 @@ class CompareViewer(QWidget):
             self.outline_item.setImage(outline_rgba(mask, self.outline_color, self._outline_width), autoLevels=False)
         else:
             self.outline_item.clear()
-
-    def _crop(self, arr):
-        if self._roi_bounds is None:
-            return arr
-        y0, y1, x0, x1 = [int(v) for v in self._roi_bounds]
-        return arr[y0:y1, x0:x1]
 
     def reset_view(self):
         self.view.autoRange()

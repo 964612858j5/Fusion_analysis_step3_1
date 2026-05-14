@@ -57,14 +57,16 @@ class ProjectLoader:
                     shape=manifest.get("shape"),
                     fusion_zarr=self._find_fusion_source(roi_dir, manifest),
                     corrected_zarr=self._find_corrected_source(roi_dir, manifest),
-                    raw_ome=_abs(self.project_dir, manifest.get("raw_ome") or manifest.get("ome_tiff")),
+                    raw_ome=_abs(self.project_dir, manifest.get("raw_ome") or manifest.get("ome_tiff") or manifest.get("source_ome")),
                 )
             )
 
         if records:
             return records
 
-        for roi_dir in sorted(glob.glob(os.path.join(self.project_dir, "rois", "roi_*"))):
+        for roi_dir in sorted(glob.glob(os.path.join(self.project_dir, "rois", "*"))):
+            if not os.path.isdir(roi_dir):
+                continue
             manifest_path = os.path.join(roi_dir, "roi_manifest.json")
             manifest = load_json(manifest_path, {}) or {}
             roi_id = manifest.get("roi_id") or os.path.basename(roi_dir)
@@ -78,29 +80,52 @@ class ProjectLoader:
                     shape=manifest.get("shape"),
                     fusion_zarr=self._find_fusion_source(roi_dir, manifest),
                     corrected_zarr=self._find_corrected_source(roi_dir, manifest),
-                    raw_ome=_abs(self.project_dir, manifest.get("raw_ome") or manifest.get("ome_tiff")),
+                    raw_ome=_abs(self.project_dir, manifest.get("raw_ome") or manifest.get("ome_tiff") or manifest.get("source_ome")),
                 )
             )
         return records
 
     def channels_for_roi(self, roi: RoiRecord):
         records = []
+        seen = set()
         if roi.corrected_zarr and os.path.exists(roi.corrected_zarr):
             try:
-                from loaders.image_io import zarr_group_names
+                from loaders.image_io import list_corrected_channels
 
-                names = zarr_group_names(roi.corrected_zarr)
-                if roi.roi_id in names:
-                    names = zarr_group_names(os.path.join(roi.corrected_zarr, roi.roi_id))
+                names = list_corrected_channels(
+                    roi.corrected_zarr,
+                    [roi.roi_id, roi.display_name, "ROI_1"],
+                )
                 for i, name in enumerate(names):
                     lower = name.lower()
-                    if lower in {"0", "1"} or lower.startswith("__"):
+                    if lower in {"0", "1"} or lower.startswith("__") or "dapi" in lower or "nuc" in lower:
                         continue
+                    seen.add(name)
                     records.append(
                         ChannelRecord(
                             name=name,
                             source="corrected_zarr",
                             color=DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)],
+                            visible=False,
+                        )
+                    )
+            except Exception:
+                pass
+        if roi.raw_ome and os.path.exists(roi.raw_ome):
+            try:
+                from block01.core.io_loader import OMETIFFLoader
+
+                raw_loader = OMETIFFLoader(roi.raw_ome)
+                base = len(records)
+                for i, name in enumerate(raw_loader.channel_names()):
+                    lower = str(name).lower()
+                    if name in seen or "dapi" in lower or "nuc" in lower:
+                        continue
+                    records.append(
+                        ChannelRecord(
+                            name=name,
+                            source="raw_ome",
+                            color=DEFAULT_CHANNEL_COLORS[(base + i) % len(DEFAULT_CHANNEL_COLORS)],
                             visible=False,
                         )
                     )
@@ -163,6 +188,12 @@ class ProjectLoader:
         created = str(meta.get("created_at") or meta.get("timestamp") or os.path.basename(run_dir))
         run_id = str(meta.get("run_id") or os.path.basename(run_dir))
         mask_zarr = _abs(run_dir, paths.get("mask_zarr") or meta.get("mask_zarr"))
+        if paths.get("fusion_zarr") and not roi.fusion_zarr:
+            roi.fusion_zarr = _abs(run_dir, paths.get("fusion_zarr"))
+        if paths.get("corrected_channels_zarr") and not roi.corrected_zarr:
+            roi.corrected_zarr = _abs(run_dir, paths.get("corrected_channels_zarr"))
+        if paths.get("raw_ome") and not roi.raw_ome:
+            roi.raw_ome = _abs(run_dir, paths.get("raw_ome"))
         cell_count = meta.get("cell_count") or meta.get("n_cells")
         return RunRecord(
             run_id=run_id,
@@ -209,7 +240,7 @@ class ProjectLoader:
             manifest.get("corrected_zarr"),
             manifest.get("corrected_channels_zarr"),
             os.path.join(roi_dir, "step1", "corrected_channels.zarr"),
-            os.path.join(roi_dir, "step2", "corrected_channels.zarr"),
+            os.path.join(roi_dir, "step0", "corrected_channels.zarr"),
             os.path.join(self.project_dir, "corrected_channels.zarr"),
         ]
         for candidate in candidates:
