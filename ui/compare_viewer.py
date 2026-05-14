@@ -2,7 +2,7 @@
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5 import QtCore
+from PyQt5 import QtCore, QtGui
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
@@ -17,6 +17,12 @@ class CompareViewer(QWidget):
         super().__init__(parent)
         self.viewer_id = viewer_id
         self.outline_color = outline_color
+        self.setObjectName(f"compareViewer{viewer_id}")
+        border_hex = QtGui.QColor(*outline_color).name()
+        self.setStyleSheet(
+            f"QWidget#compareViewer{viewer_id}{{border:1px solid {border_hex};"
+            "border-radius:5px;background:#101010;}"
+        )
         self._sync_guard = False
         self._dapi = None
         self._mask = None
@@ -26,6 +32,8 @@ class CompareViewer(QWidget):
         self._stride = 1
         self._dapi_intensity = 1.0
         self._fusion_intensity = 1.0
+        self._dapi_color = (51, 102, 255)
+        self._fusion_color = (255, 51, 51)
         self._show_outline = True
         self._outline_width = 0.5
         self._mask_alpha = 0.0
@@ -33,10 +41,13 @@ class CompareViewer(QWidget):
         self._show_fusion = False
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(2)
         self.title = QLabel(f"Viewer {viewer_id}\nNo run selected")
-        self.title.setStyleSheet("color:#ddd;background:#222;padding:4px;font-size:11px;")
+        self.title.setStyleSheet(
+            f"color:rgb({outline_color[0]},{outline_color[1]},{outline_color[2]});"
+            "background:#1a1a1a;padding:4px;font-size:11px;font-weight:bold;"
+        )
         self.title.setWordWrap(True)
         lay.addWidget(self.title)
 
@@ -49,6 +60,11 @@ class CompareViewer(QWidget):
         self.image_item = pg.ImageItem()
         self.fill_item = pg.ImageItem()
         self.outline_item = pg.ImageItem()
+        for item in (self.image_item, self.fill_item, self.outline_item):
+            try:
+                item.setOpts(axisOrder="row-major")
+            except Exception:
+                pass
         self.view.addItem(self.image_item)
         self.view.addItem(self.fill_item)
         self.view.addItem(self.outline_item)
@@ -79,8 +95,11 @@ class CompareViewer(QWidget):
             self._outline_width = max(0.25, float(outline_width))
         if dapi_intensity is not None:
             self._dapi_intensity = float(dapi_intensity)
+        if channel_settings is not None and "__dapi__" in channel_settings:
+            self._dapi_color = channel_settings["__dapi__"].get("rgb", self._dapi_color)
         if channel_settings is not None and "__fusion__" in channel_settings:
             self._fusion_intensity = float(channel_settings["__fusion__"].get("intensity", self._fusion_intensity))
+            self._fusion_color = channel_settings["__fusion__"].get("rgb", self._fusion_color)
         if mask_alpha is not None:
             self._mask_alpha = float(mask_alpha)
         if show_dapi is not None:
@@ -99,6 +118,15 @@ class CompareViewer(QWidget):
 
     def set_outline_color(self, color):
         self.outline_color = color
+        border_hex = QtGui.QColor(*color).name()
+        self.setStyleSheet(
+            f"QWidget#{self.objectName()}{{border:1px solid {border_hex};"
+            "border-radius:5px;background:#101010;}"
+        )
+        self.title.setStyleSheet(
+            f"color:rgb({color[0]},{color[1]},{color[2]});"
+            "background:#1a1a1a;padding:4px;font-size:11px;font-weight:bold;"
+        )
         self.render()
 
     def render(self):
@@ -128,9 +156,11 @@ class CompareViewer(QWidget):
             rgb = compose_overlay_rgb(dapi, fusion=fusion, marker_layers=marker_layers,
                                       dapi_visible=self._show_dapi, fusion_visible=self._show_fusion,
                                       dapi_intensity=self._dapi_intensity,
-                                      fusion_intensity=self._fusion_intensity)
+                                      fusion_intensity=self._fusion_intensity,
+                                      dapi_color=self._dapi_color,
+                                      fusion_color=self._fusion_color)
         elif self._show_dapi:
-            rgb = dapi_rgb(dapi, self._dapi_intensity)
+            rgb = dapi_rgb(dapi, self._dapi_intensity, color=self._dapi_color)
         else:
             rgb = np.zeros(dapi.shape + (3,), dtype=np.uint8)
         self.image_item.setImage(rgb, autoLevels=False)

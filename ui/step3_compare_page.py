@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSplitter,
     QVBoxLayout,
@@ -50,6 +51,8 @@ class Step31ComparePage(QWidget):
         self._dapi_intensity = 1.0
         self._show_dapi = True
         self._show_fusion = False
+        self._dapi_color = "#3366ff"
+        self._fusion_color = "#ff3333"
         self._preview_roi = None
         self._preview_stride = 1
         self._outline_colors = {
@@ -60,38 +63,20 @@ class Step31ComparePage(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
+        root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Project directory:"))
-        self.project_edit = QLineEdit()
-        self.project_edit.setPlaceholderText("Select project directory containing roi_index.json")
-        top.addWidget(self.project_edit, stretch=2)
-        browse = QPushButton("Browse")
-        browse.clicked.connect(self._browse_project)
-        top.addWidget(browse)
-        top.addWidget(QLabel("ROI:"))
-        self.roi_combo = QComboBox()
-        self.roi_combo.currentIndexChanged.connect(self._on_roi_changed)
-        top.addWidget(self.roi_combo, stretch=1)
-        self.load_btn = QPushButton("Load")
-        self.load_btn.clicked.connect(self._load_selected_runs)
-        top.addWidget(self.load_btn)
-        root.addLayout(top)
-
-        run_row = QHBoxLayout()
-        self.run_combos = {}
-        for viewer_id in ("A", "B", "C", "D"):
-            run_row.addWidget(QLabel(f"Viewer {viewer_id}:"))
-            combo = QComboBox()
-            self.run_combos[viewer_id] = combo
-            run_row.addWidget(combo, stretch=1)
-        root.addLayout(run_row)
+        title = QLabel("Step 3.1 — Multi-method Segmentation QC Comparator")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            "font-size:16px;font-weight:bold;color:#eee;"
+            "background:#1a1a1a;padding:6px;border-radius:4px;"
+        )
+        root.addWidget(title)
 
         split = QSplitter(Qt.Horizontal)
-        split.addWidget(self._make_control_panel())
-        split.addWidget(self._make_main_view_area())
+        split.addWidget(self._make_left_sidebar())
+        split.addWidget(self._make_right_compare_area())
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         root.addWidget(split, stretch=1)
@@ -104,24 +89,74 @@ class Step31ComparePage(QWidget):
         self.setStyleSheet(
             """
             QWidget { background:#111; color:#ddd; }
-            QGroupBox { border:1px solid #333; border-radius:4px; margin-top:8px; padding:6px; }
-            QGroupBox::title { subcontrol-origin: margin; left:8px; padding:0 4px; color:#f0a030; }
-            QPushButton { background:#2a2a2a; border:1px solid #555; padding:5px 8px; border-radius:3px; }
+            QPushButton { background:#2a2a2a; border:1px solid #555; padding:4px 8px; border-radius:3px; font-size:11px; }
             QPushButton:hover { background:#3a3a3a; }
-            QLineEdit, QComboBox { background:#1b1b1b; border:1px solid #444; padding:4px; }
+            QLineEdit, QComboBox { background:#1b1b1b; border:1px solid #444; padding:3px; font-size:10px; }
             QCheckBox { spacing:6px; }
             QLabel { color:#ddd; }
             """
         )
 
-    def _make_control_panel(self):
+    @staticmethod
+    def _box_style(color):
+        return (
+            f"QGroupBox{{border:1px solid {color};border-radius:5px;"
+            f"margin-top:4px;font-weight:bold;color:{color};font-size:11px;}}"
+            "QGroupBox::title{subcontrol-origin:margin;left:8px;padding:0 4px;}"
+        )
+
+    def _make_left_sidebar(self):
         panel = QWidget()
+        panel.setMinimumWidth(440)
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 4, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
 
-        view_box = QGroupBox("View Controls")
-        view_lay = QVBoxLayout(view_box)
+        input_box = QGroupBox("Input")
+        input_box.setStyleSheet(self._box_style("#61afef"))
+        il = QVBoxLayout(input_box)
+        proj_row = QHBoxLayout()
+        proj_row.addWidget(QLabel("Project directory:"))
+        self.project_edit = QLineEdit()
+        self.project_edit.setPlaceholderText("Select project directory containing roi_index.json")
+        proj_row.addWidget(self.project_edit, stretch=1)
+        browse = QPushButton("Browse")
+        browse.setFixedWidth(64)
+        browse.clicked.connect(self._browse_project)
+        proj_row.addWidget(browse)
+        il.addLayout(proj_row)
+
+        roi_row = QHBoxLayout()
+        roi_row.addWidget(QLabel("ROI:"))
+        self.roi_combo = QComboBox()
+        self.roi_combo.currentIndexChanged.connect(self._on_roi_changed)
+        roi_row.addWidget(self.roi_combo, stretch=1)
+        self.load_btn = QPushButton("Load / Refresh")
+        self.load_btn.clicked.connect(self._load_selected_runs)
+        roi_row.addWidget(self.load_btn)
+        il.addLayout(roi_row)
+        lay.addWidget(input_box)
+
+        preview_box = QGroupBox("Preview / Patch")
+        preview_box.setStyleSheet(self._box_style("#e5c07b"))
+        pl = QVBoxLayout(preview_box)
+        hint = QLabel("Draw a QC patch on the ROI preview. The comparison viewers reload this patch at full resolution.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#aaa;font-size:10px;")
+        pl.addWidget(hint)
+        self.preview = OverviewViewer()
+        self.preview.roi_changed.connect(self._on_preview_roi_changed)
+        pl.addWidget(self.preview, stretch=1)
+        lay.addWidget(preview_box, stretch=3)
+
+        lay.addWidget(self._make_channel_overlay_panel(), stretch=4)
+        return panel
+
+    def _make_compact_toolbar(self):
+        bar = QWidget()
+        view_lay = QHBoxLayout(bar)
+        view_lay.setContentsMargins(0, 0, 0, 0)
+        view_lay.setSpacing(6)
         self.sync_chk = QCheckBox("Sync zoom/pan")
         self.sync_chk.setChecked(True)
         self.sync_chk.toggled.connect(self._set_sync_enabled)
@@ -132,81 +167,125 @@ class Step31ComparePage(QWidget):
         reset_current = QPushButton("Reset current")
         reset_current.clicked.connect(self._reset_current)
         view_lay.addWidget(reset_current)
-        lay.addWidget(view_box)
-
-        mask_box = QGroupBox("Mask Controls")
-        mask_lay = QVBoxLayout(mask_box)
         self.outline_chk = QCheckBox("Show outline")
         self.outline_chk.setChecked(True)
         self.outline_chk.toggled.connect(self._update_display_controls)
-        mask_lay.addWidget(self.outline_chk)
-        width_row = QHBoxLayout()
-        width_row.addWidget(QLabel("Outline width:"))
+        view_lay.addWidget(self.outline_chk)
+        view_lay.addWidget(QLabel("Outline:"))
         self.width_slider = QSlider(Qt.Horizontal)
         self.width_slider.setRange(0, len(OUTLINE_WIDTH_OPTIONS) - 1)
         self.width_slider.setValue(DEFAULT_OUTLINE_WIDTH_INDEX)
+        self.width_slider.setFixedWidth(100)
         self.width_slider.valueChanged.connect(self._update_display_controls)
-        width_row.addWidget(self.width_slider)
+        view_lay.addWidget(self.width_slider)
         self.width_label = QLabel(f"{self._outline_width:g} px")
-        width_row.addWidget(self.width_label)
-        mask_lay.addLayout(width_row)
-        alpha_row = QHBoxLayout()
-        alpha_row.addWidget(QLabel("Fill alpha:"))
+        self.width_label.setFixedWidth(44)
+        self.width_label.setStyleSheet("color:#8e8;font-size:10px;")
+        view_lay.addWidget(self.width_label)
+        view_lay.addWidget(QLabel("Mask alpha:"))
         self.alpha_slider = QSlider(Qt.Horizontal)
         self.alpha_slider.setRange(0, 80)
         self.alpha_slider.setValue(0)
+        self.alpha_slider.setFixedWidth(100)
         self.alpha_slider.valueChanged.connect(self._update_display_controls)
-        alpha_row.addWidget(self.alpha_slider)
-        mask_lay.addLayout(alpha_row)
+        view_lay.addWidget(self.alpha_slider)
         color_btn = QPushButton("Set current outline color")
         color_btn.clicked.connect(self._choose_current_color)
-        mask_lay.addWidget(color_btn)
-        lay.addWidget(mask_box)
+        view_lay.addWidget(color_btn)
+        view_lay.addStretch()
+        return bar
 
-        display_box = QGroupBox("Display Controls")
-        display_lay = QVBoxLayout(display_box)
+    def _make_channel_overlay_panel(self):
+        ch_box = QGroupBox("Channel Overlay")
+        ch_box.setStyleSheet(self._box_style("#56b6c2"))
+        ch_lay = QVBoxLayout(ch_box)
+        ch_lay.setSpacing(4)
+
+        def _section(label):
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color:#56b6c2;font-weight:bold;font-size:10px;padding-top:4px;")
+            ch_lay.addWidget(lbl)
+
+        _section("DAPI Overlay")
+        dapi_row = QHBoxLayout()
         self.dapi_chk = QCheckBox("DAPI")
         self.dapi_chk.setChecked(True)
         self.dapi_chk.toggled.connect(self._update_display_controls)
-        display_lay.addWidget(self.dapi_chk)
-        self.fusion_chk = QCheckBox("Fusion")
-        self.fusion_chk.setChecked(False)
-        self.fusion_chk.toggled.connect(self._update_display_controls)
-        display_lay.addWidget(self.fusion_chk)
-        dapi_row = QHBoxLayout()
-        dapi_row.addWidget(QLabel("DAPI intensity:"))
+        dapi_row.addWidget(self.dapi_chk)
+        self.dapi_color_btn = QPushButton()
+        self.dapi_color_btn.setFixedSize(24, 18)
+        self.dapi_color_btn.setStyleSheet("background:#3366ff;border:1px solid #777;")
+        self.dapi_color_btn.clicked.connect(lambda: self._choose_layer_color("dapi"))
+        dapi_row.addWidget(self.dapi_color_btn)
+        dapi_row.addWidget(QLabel("intensity"))
         self.dapi_slider = QSlider(Qt.Horizontal)
         self.dapi_slider.setRange(10, 300)
         self.dapi_slider.setValue(100)
         self.dapi_slider.valueChanged.connect(self._update_display_controls)
-        dapi_row.addWidget(self.dapi_slider)
-        display_lay.addLayout(dapi_row)
+        dapi_row.addWidget(self.dapi_slider, stretch=1)
+        ch_lay.addLayout(dapi_row)
+
+        _section("Fusion Overlay")
         fusion_row = QHBoxLayout()
-        fusion_row.addWidget(QLabel("Fusion intensity:"))
+        self.fusion_chk = QCheckBox("Fusion")
+        self.fusion_chk.setChecked(False)
+        self.fusion_chk.toggled.connect(self._update_display_controls)
+        fusion_row.addWidget(self.fusion_chk)
+        self.fusion_color_btn = QPushButton()
+        self.fusion_color_btn.setFixedSize(24, 18)
+        self.fusion_color_btn.setStyleSheet("background:#ff3333;border:1px solid #777;")
+        self.fusion_color_btn.clicked.connect(lambda: self._choose_layer_color("fusion"))
+        fusion_row.addWidget(self.fusion_color_btn)
+        fusion_row.addWidget(QLabel("intensity"))
         self.fusion_slider = QSlider(Qt.Horizontal)
         self.fusion_slider.setRange(10, 300)
         self.fusion_slider.setValue(100)
         self.fusion_slider.valueChanged.connect(self._update_display_controls)
-        fusion_row.addWidget(self.fusion_slider)
-        display_lay.addLayout(fusion_row)
-        lay.addWidget(display_box)
+        fusion_row.addWidget(self.fusion_slider, stretch=1)
+        ch_lay.addLayout(fusion_row)
 
-        self.channel_box = QGroupBox("Marker Channels")
-        self.channel_lay = QVBoxLayout(self.channel_box)
+        _section("Marker Channels")
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self.channel_search = QLineEdit()
+        self.channel_search.setPlaceholderText("Search channels...")
+        self.channel_search.textChanged.connect(self._rebuild_channel_controls)
+        search_row.addWidget(self.channel_search, stretch=1)
+        clear_btn = QPushButton("Clear all")
+        clear_btn.clicked.connect(self._clear_marker_channels)
+        search_row.addWidget(clear_btn)
+        ch_lay.addLayout(search_row)
+
+        self.channel_scroll = QScrollArea()
+        self.channel_scroll.setWidgetResizable(True)
+        self.channel_scroll.setStyleSheet("QScrollArea{border:none;}")
+        self.channel_w = QWidget()
+        self.channel_lay = QVBoxLayout(self.channel_w)
+        self.channel_lay.setContentsMargins(2, 2, 2, 2)
+        self.channel_lay.setSpacing(2)
         self.channel_lay.addWidget(QLabel("No marker channels loaded"))
-        lay.addWidget(self.channel_box)
+        self.channel_scroll.setWidget(self.channel_w)
+        ch_lay.addWidget(self.channel_scroll, stretch=1)
+        return ch_box
 
-        lay.addStretch()
-        return panel
-
-    def _make_main_view_area(self):
+    def _make_right_compare_area(self):
         box = QWidget()
         lay = QVBoxLayout(box)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        self.preview = OverviewViewer()
-        self.preview.roi_changed.connect(self._on_preview_roi_changed)
-        lay.addWidget(self.preview, stretch=1)
+        lay.setSpacing(6)
+        run_box = QGroupBox("Segmentation Results")
+        run_box.setStyleSheet(self._box_style("#c678dd"))
+        run_lay = QVBoxLayout(run_box)
+        run_row = QHBoxLayout()
+        self.run_combos = {}
+        for viewer_id in ("A", "B", "C", "D"):
+            run_row.addWidget(QLabel(f"Viewer {viewer_id}:"))
+            combo = QComboBox()
+            self.run_combos[viewer_id] = combo
+            run_row.addWidget(combo, stretch=1)
+        run_lay.addLayout(run_row)
+        run_lay.addWidget(self._make_compact_toolbar())
+        lay.addWidget(run_box)
         lay.addWidget(self._make_viewer_grid(), stretch=3)
         return box
 
@@ -400,7 +479,13 @@ class Step31ComparePage(QWidget):
         dapi_intensity = self.dapi_slider.value() / 100.0
         mask_alpha = self.alpha_slider.value() / 100.0
         channel_settings = self._current_channel_settings()
-        channel_settings["__fusion__"] = {"intensity": self.fusion_slider.value() / 100.0}
+        dapi_color = QtGui.QColor(self._dapi_color)
+        fusion_color = QtGui.QColor(self._fusion_color)
+        channel_settings["__dapi__"] = {"rgb": (dapi_color.red(), dapi_color.green(), dapi_color.blue())}
+        channel_settings["__fusion__"] = {
+            "intensity": self.fusion_slider.value() / 100.0,
+            "rgb": (fusion_color.red(), fusion_color.green(), fusion_color.blue()),
+        }
         for viewer in self.viewers.values():
             viewer.set_display(
                 show_outline=show_outline,
@@ -442,7 +527,16 @@ class Step31ComparePage(QWidget):
             for viewer_id, run in self._selected_runs.items():
                 self._start_patch_load(viewer_id, run, bounds)
 
-    def _rebuild_channel_controls(self):
+    def _rebuild_channel_controls(self, *_):
+        previous = {}
+        for name, widgets in self._channel_settings.items():
+            previous[name] = {
+                "checked": widgets["check"].isChecked(),
+                "color": widgets["color"],
+                "alpha": widgets["alpha"].value(),
+                "p_low": widgets["p_low"].value(),
+                "p_high": widgets["p_high"].value(),
+            }
         while self.channel_lay.count():
             item = self.channel_lay.takeAt(0)
             widget = item.widget()
@@ -452,35 +546,42 @@ class Step31ComparePage(QWidget):
         if not self._channels:
             self.channel_lay.addWidget(QLabel("No marker channels found"))
             return
-        for ch in self._channels[:24]:
+        query = str(self.channel_search.text() if hasattr(self, "channel_search") else "").strip().lower()
+        filtered = [ch for ch in self._channels if not query or query in ch.name.lower()]
+        if not filtered:
+            self.channel_lay.addWidget(QLabel("No matching channels."))
+            return
+        for ch in filtered[:80]:
+            old = previous.get(ch.name, {})
             row = QHBoxLayout()
             chk = QCheckBox(ch.name)
-            chk.setChecked(False)
+            chk.setChecked(bool(old.get("checked", False)))
             chk.toggled.connect(self._on_channel_controls_changed)
             color_btn = QPushButton()
             color_btn.setFixedWidth(24)
-            color_btn.setStyleSheet(f"background:{ch.color}; border:1px solid #666;")
+            color = old.get("color", ch.color)
+            color_btn.setStyleSheet(f"background:{color}; border:1px solid #666;")
             alpha = QSlider(Qt.Horizontal)
             alpha.setRange(0, 100)
-            alpha.setValue(int(ch.alpha * 100))
+            alpha.setValue(int(old.get("alpha", int(ch.alpha * 100))))
             alpha.valueChanged.connect(self._on_channel_controls_changed)
             p_low = QDoubleSpinBox()
             p_low.setRange(0.0, 99.0)
             p_low.setDecimals(1)
             p_low.setSingleStep(0.5)
-            p_low.setValue(1.0)
+            p_low.setValue(float(old.get("p_low", 1.0)))
             p_low.setFixedWidth(56)
             p_low.valueChanged.connect(self._on_channel_controls_changed)
             p_high = QDoubleSpinBox()
             p_high.setRange(1.0, 100.0)
             p_high.setDecimals(1)
             p_high.setSingleStep(0.5)
-            p_high.setValue(99.5)
+            p_high.setValue(float(old.get("p_high", 99.5)))
             p_high.setFixedWidth(64)
             p_high.valueChanged.connect(self._on_channel_controls_changed)
             self._channel_settings[ch.name] = {
                 "check": chk,
-                "color": ch.color,
+                "color": color,
                 "alpha": alpha,
                 "button": color_btn,
                 "p_low": p_low,
@@ -495,6 +596,24 @@ class Step31ComparePage(QWidget):
             row.addWidget(p_low)
             row.addWidget(p_high)
             self.channel_lay.addLayout(row)
+
+    def _clear_marker_channels(self):
+        for widgets in self._channel_settings.values():
+            widgets["check"].setChecked(False)
+        self._update_display_controls()
+
+    def _choose_layer_color(self, layer):
+        current = self._dapi_color if layer == "dapi" else self._fusion_color
+        color = QtWidgets.QColorDialog.getColor(QtGui.QColor(current), self, f"{layer.upper()} color")
+        if not color.isValid():
+            return
+        if layer == "dapi":
+            self._dapi_color = color.name()
+            self.dapi_color_btn.setStyleSheet(f"background:{color.name()};border:1px solid #777;")
+        else:
+            self._fusion_color = color.name()
+            self.fusion_color_btn.setStyleSheet(f"background:{color.name()};border:1px solid #777;")
+        self._update_display_controls()
 
     def _current_channel_settings(self):
         out = {}

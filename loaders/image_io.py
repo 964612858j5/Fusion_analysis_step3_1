@@ -171,14 +171,15 @@ def normalize_float(arr, p_low=1.0, p_high=99.5):
     return u8.astype(np.float32) / 255.0
 
 
-def dapi_rgb(arr, intensity=1.0):
+def dapi_rgb(arr, intensity=1.0, color=(51, 102, 255)):
     u8 = normalize_u8(arr)
     scale = float(np.clip(intensity, 0.0, 3.0))
-    blue = np.clip(u8.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+    signal = np.clip(u8.astype(np.float32) * scale, 0, 255)
+    color = np.asarray(color, dtype=np.float32) / 255.0
     rgb = np.zeros(u8.shape + (3,), dtype=np.uint8)
-    rgb[..., 2] = blue
-    rgb[..., 0] = (blue.astype(np.float32) * 0.18).astype(np.uint8)
-    rgb[..., 1] = (blue.astype(np.float32) * 0.34).astype(np.uint8)
+    rgb[..., 0] = np.clip(signal * color[0], 0, 255).astype(np.uint8)
+    rgb[..., 1] = np.clip(signal * color[1], 0, 255).astype(np.uint8)
+    rgb[..., 2] = np.clip(signal * color[2], 0, 255).astype(np.uint8)
     return rgb
 
 
@@ -190,23 +191,23 @@ def compose_overlay_rgb(
     fusion_visible=False,
     dapi_intensity=1.0,
     fusion_intensity=1.0,
+    dapi_color=(51, 102, 255),
+    fusion_color=(255, 51, 51),
 ):
     """Compose DAPI, optional fusion, and marker overlays into RGB uint8."""
     base_shape = np.asarray(dapi).shape[:2]
     canvas = np.zeros(base_shape + (3,), dtype=np.float32)
     if dapi_visible:
-        canvas += dapi_rgb(dapi, intensity=dapi_intensity).astype(np.float32) / 255.0
+        canvas += dapi_rgb(dapi, intensity=dapi_intensity, color=dapi_color).astype(np.float32) / 255.0
     if fusion_visible and fusion is not None:
         f = np.asarray(fusion)
+        color = np.asarray(fusion_color, dtype=np.float32) / 255.0
         if f.ndim == 3 and f.shape[2] >= 3:
-            frgb = f.astype(np.float32)
-            if frgb.max(initial=0) > 1.0:
-                frgb /= 255.0
-            canvas += frgb[:, :, :3] * float(np.clip(fusion_intensity, 0.0, 3.0))
+            signal = normalize_float(f[:, :, 0])
+            canvas += signal[:, :, None] * color[None, None, :] * float(np.clip(fusion_intensity, 0.0, 3.0))
         else:
             norm = normalize_float(f)
-            canvas[:, :, 0] += norm * float(np.clip(fusion_intensity, 0.0, 3.0))
-            canvas[:, :, 1] += norm * 0.5 * float(np.clip(fusion_intensity, 0.0, 3.0))
+            canvas += norm[:, :, None] * color[None, None, :] * float(np.clip(fusion_intensity, 0.0, 3.0))
     for layer in marker_layers or []:
         arr = layer.get("array")
         if arr is None:
