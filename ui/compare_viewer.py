@@ -6,7 +6,7 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from loaders.image_io import dapi_rgb, outline_rgba
+from loaders.image_io import compose_overlay_rgb, dapi_rgb, mask_fill_rgba, outline_rgba
 
 
 class CompareViewer(QWidget):
@@ -20,10 +20,17 @@ class CompareViewer(QWidget):
         self._sync_guard = False
         self._dapi = None
         self._mask = None
+        self._fusion = None
+        self._markers = {}
+        self._channel_settings = {}
+        self._roi_bounds = None
         self._stride = 1
         self._dapi_intensity = 1.0
         self._show_outline = True
-        self._outline_width = 1
+        self._outline_width = 0.5
+        self._mask_alpha = 0.0
+        self._show_dapi = True
+        self._show_fusion = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
@@ -40,8 +47,10 @@ class CompareViewer(QWidget):
         self.view.invertY(True)
         self.view.setMenuEnabled(False)
         self.image_item = pg.ImageItem()
+        self.fill_item = pg.ImageItem()
         self.outline_item = pg.ImageItem()
         self.view.addItem(self.image_item)
+        self.view.addItem(self.fill_item)
         self.view.addItem(self.outline_item)
         self.view.sigRangeChanged.connect(self._on_range_changed)
         self.canvas.scene().sigMouseClicked.connect(self._on_mouse_clicked)
@@ -57,14 +66,33 @@ class CompareViewer(QWidget):
         self.render()
         self.reset_view()
 
-    def set_display(self, show_outline=None, outline_width=None, dapi_intensity=None):
+    def set_overlay_data(self, fusion=None, markers=None):
+        self._fusion = None if fusion is None else np.asarray(fusion)
+        self._markers = markers or {}
+        self.render()
+
+    def set_display(self, show_outline=None, outline_width=None, dapi_intensity=None,
+                    mask_alpha=None, show_dapi=None, show_fusion=None, channel_settings=None):
         if show_outline is not None:
             self._show_outline = bool(show_outline)
         if outline_width is not None:
-            self._outline_width = max(1, int(outline_width))
+            self._outline_width = max(0.25, float(outline_width))
         if dapi_intensity is not None:
             self._dapi_intensity = float(dapi_intensity)
+        if mask_alpha is not None:
+            self._mask_alpha = float(mask_alpha)
+        if show_dapi is not None:
+            self._show_dapi = bool(show_dapi)
+        if show_fusion is not None:
+            self._show_fusion = bool(show_fusion)
+        if channel_settings is not None:
+            self._channel_settings = channel_settings
         self.render()
+
+    def set_roi_bounds(self, bounds):
+        self._roi_bounds = bounds
+        self.render()
+        self.reset_view()
 
     def set_outline_color(self, color):
         self.outline_color = color
@@ -73,16 +101,48 @@ class CompareViewer(QWidget):
     def render(self):
         if self._dapi is None:
             self.image_item.clear()
+            self.fill_item.clear()
             self.outline_item.clear()
             return
-        self.image_item.setImage(dapi_rgb(self._dapi, self._dapi_intensity), autoLevels=False)
-        if self._show_outline and self._mask is not None:
-            self.outline_item.setImage(
-                outline_rgba(self._mask, self.outline_color, self._outline_width),
-                autoLevels=False,
+        dapi = self._crop(self._dapi)
+        mask = None if self._mask is None else self._crop(self._mask)
+        fusion = None if self._fusion is None else self._crop(self._fusion)
+        marker_layers = []
+        for name, arr in self._markers.items():
+            st = self._channel_settings.get(name, {})
+            if not st.get("visible", False):
+                continue
+            marker_layers.append(
+                {
+                    "array": self._crop(arr),
+                    "color": st.get("rgb", (255, 255, 255)),
+                    "alpha": st.get("alpha", 0.65),
+                    "p_low": st.get("p_low", 1.0),
+                    "p_high": st.get("p_high", 99.5),
+                }
             )
+        if marker_layers or self._show_fusion:
+            rgb = compose_overlay_rgb(dapi, fusion=fusion, marker_layers=marker_layers,
+                                      dapi_visible=self._show_dapi, fusion_visible=self._show_fusion)
+        elif self._show_dapi:
+            rgb = dapi_rgb(dapi, self._dapi_intensity)
+        else:
+            rgb = np.zeros(dapi.shape + (3,), dtype=np.uint8)
+        self.image_item.setImage(rgb, autoLevels=False)
+        if mask is not None and self._mask_alpha > 0:
+            self.fill_item.setImage(mask_fill_rgba(mask, self.outline_color, self._mask_alpha), autoLevels=False)
+        else:
+            self.fill_item.clear()
+        if self._show_outline and mask is not None:
+            self.outline_item.setImage(outline_rgba(mask, self.outline_color, self._outline_width), autoLevels=False)
         else:
             self.outline_item.clear()
+
+    def _crop(self, arr):
+        if self._roi_bounds is None:
+            return arr
+        y0, y1, x0, x1 = [int(v) for v in self._roi_bounds]
+        return arr[y0:y1, x0:x1]
 
     def reset_view(self):
         self.view.autoRange()

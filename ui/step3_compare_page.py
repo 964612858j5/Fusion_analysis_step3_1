@@ -22,8 +22,10 @@ from PyQt5.QtWidgets import (
 )
 
 from configs.defaults import VIEWER_COLORS
+from configs.defaults import OUTLINE_WIDTH_OPTIONS, DEFAULT_OUTLINE_WIDTH_INDEX
 from loaders.project_loader import ProjectLoader
 from ui.compare_viewer import CompareViewer
+from ui.overview_viewer import OverviewViewer
 from workers.compare_loader import RunLoadWorker
 
 
@@ -36,15 +38,22 @@ class Step31ComparePage(QWidget):
         self._rois = []
         self._runs = []
         self._run_by_id = {}
+        self._channels = []
+        self._channel_settings = {}
         self._workers = {}
         self._sync_enabled = True
         self._selected_viewer = "A"
-        self._outline_width = 1
+        self._outline_width = OUTLINE_WIDTH_OPTIONS[DEFAULT_OUTLINE_WIDTH_INDEX]
+        self._mask_alpha = 0.0
         self._dapi_intensity = 1.0
+        self._show_dapi = True
+        self._show_fusion = False
+        self._preview_roi = None
         self._outline_colors = {
             key: self._hex_to_rgb(value) for key, value in VIEWER_COLORS.items()
         }
         self._build_ui()
+        self._apply_v7_style()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -79,7 +88,7 @@ class Step31ComparePage(QWidget):
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self._make_control_panel())
-        split.addWidget(self._make_viewer_grid())
+        split.addWidget(self._make_main_view_area())
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         root.addWidget(split, stretch=1)
@@ -87,6 +96,20 @@ class Step31ComparePage(QWidget):
         self.status = QLabel("No project loaded")
         self.status.setStyleSheet("color:#aaa;font-size:11px;")
         root.addWidget(self.status)
+
+    def _apply_v7_style(self):
+        self.setStyleSheet(
+            """
+            QWidget { background:#111; color:#ddd; }
+            QGroupBox { border:1px solid #333; border-radius:4px; margin-top:8px; padding:6px; }
+            QGroupBox::title { subcontrol-origin: margin; left:8px; padding:0 4px; color:#f0a030; }
+            QPushButton { background:#2a2a2a; border:1px solid #555; padding:5px 8px; border-radius:3px; }
+            QPushButton:hover { background:#3a3a3a; }
+            QLineEdit, QComboBox { background:#1b1b1b; border:1px solid #444; padding:4px; }
+            QCheckBox { spacing:6px; }
+            QLabel { color:#ddd; }
+            """
+        )
 
     def _make_control_panel(self):
         panel = QWidget()
@@ -117,11 +140,21 @@ class Step31ComparePage(QWidget):
         width_row = QHBoxLayout()
         width_row.addWidget(QLabel("Outline width:"))
         self.width_slider = QSlider(Qt.Horizontal)
-        self.width_slider.setRange(1, 5)
-        self.width_slider.setValue(1)
+        self.width_slider.setRange(0, len(OUTLINE_WIDTH_OPTIONS) - 1)
+        self.width_slider.setValue(DEFAULT_OUTLINE_WIDTH_INDEX)
         self.width_slider.valueChanged.connect(self._update_display_controls)
         width_row.addWidget(self.width_slider)
+        self.width_label = QLabel(f"{self._outline_width:g} px")
+        width_row.addWidget(self.width_label)
         mask_lay.addLayout(width_row)
+        alpha_row = QHBoxLayout()
+        alpha_row.addWidget(QLabel("Fill alpha:"))
+        self.alpha_slider = QSlider(Qt.Horizontal)
+        self.alpha_slider.setRange(0, 80)
+        self.alpha_slider.setValue(0)
+        self.alpha_slider.valueChanged.connect(self._update_display_controls)
+        alpha_row.addWidget(self.alpha_slider)
+        mask_lay.addLayout(alpha_row)
         color_btn = QPushButton("Set current outline color")
         color_btn.clicked.connect(self._choose_current_color)
         mask_lay.addWidget(color_btn)
@@ -129,6 +162,14 @@ class Step31ComparePage(QWidget):
 
         display_box = QGroupBox("Display Controls")
         display_lay = QVBoxLayout(display_box)
+        self.dapi_chk = QCheckBox("DAPI")
+        self.dapi_chk.setChecked(True)
+        self.dapi_chk.toggled.connect(self._update_display_controls)
+        display_lay.addWidget(self.dapi_chk)
+        self.fusion_chk = QCheckBox("Fusion")
+        self.fusion_chk.setChecked(False)
+        self.fusion_chk.toggled.connect(self._update_display_controls)
+        display_lay.addWidget(self.fusion_chk)
         dapi_row = QHBoxLayout()
         dapi_row.addWidget(QLabel("DAPI intensity:"))
         self.dapi_slider = QSlider(Qt.Horizontal)
@@ -139,8 +180,24 @@ class Step31ComparePage(QWidget):
         display_lay.addLayout(dapi_row)
         lay.addWidget(display_box)
 
+        self.channel_box = QGroupBox("Marker Channels")
+        self.channel_lay = QVBoxLayout(self.channel_box)
+        self.channel_lay.addWidget(QLabel("No marker channels loaded"))
+        lay.addWidget(self.channel_box)
+
         lay.addStretch()
         return panel
+
+    def _make_main_view_area(self):
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.preview = OverviewViewer()
+        self.preview.roi_changed.connect(self._on_preview_roi_changed)
+        lay.addWidget(self.preview, stretch=1)
+        lay.addWidget(self._make_viewer_grid(), stretch=3)
+        return box
 
     def _make_viewer_grid(self):
         grid_w = QWidget()
@@ -186,6 +243,8 @@ class Step31ComparePage(QWidget):
         if roi is None or self._loader is None:
             return
         self._runs = self._loader.runs_for_roi(roi)
+        self._channels = self._loader.channels_for_roi(roi)
+        self._rebuild_channel_controls()
         self._run_by_id = {run.run_id: run for run in self._runs}
         print(f"[Step3.1] selected roi_id={roi.roi_id}")
         print(f"[Step3.1] available runs={len(self._runs)}")
@@ -197,7 +256,8 @@ class Step31ComparePage(QWidget):
         for i, viewer_id in enumerate(("A", "B", "C", "D"), start=0):
             if i + 1 < self.run_combos[viewer_id].count():
                 self.run_combos[viewer_id].setCurrentIndex(i + 1)
-        self.status.setText(f"{roi.display_name}: {len(self._runs)} segmentation run(s).")
+        fusion_status = "Fusion available" if roi.fusion_zarr else "Fusion fallback to DAPI"
+        self.status.setText(f"{roi.display_name}: {len(self._runs)} segmentation run(s). {fusion_status}.")
 
     def _load_selected_runs(self):
         if self._loader is None or self.project_edit.text().strip() != self._project_dir:
@@ -235,15 +295,24 @@ class Step31ComparePage(QWidget):
         print(f"[Viewer{viewer_id}] method={run.method}")
         print(f"[Viewer{viewer_id}] dapi={run.dapi_ome}")
         print(f"[Viewer{viewer_id}] mask={run.mask_ome}")
-        worker = RunLoadWorker(viewer_id, run.dapi_ome, run.mask_ome, self)
-        worker.loaded.connect(lambda vid, dapi, mask, stride, r=run, label=label: self._on_run_loaded(vid, r, label, dapi, mask, stride))
+        roi = self.roi_combo.currentData()
+        worker = RunLoadWorker(viewer_id, run.dapi_ome, run.mask_ome, roi=roi, channels=self._channels, parent=self)
+        worker.loaded.connect(lambda vid, dapi, mask, stride, overlays, r=run, label=label: self._on_run_loaded(vid, r, label, dapi, mask, stride, overlays))
         worker.failed.connect(self._on_run_failed)
         self._workers[viewer_id] = worker
         worker.start()
 
-    def _on_run_loaded(self, viewer_id, run, label, dapi, mask, stride):
+    def _on_run_loaded(self, viewer_id, run, label, dapi, mask, stride, overlays):
         self.viewers[viewer_id].set_run_label(label)
         self.viewers[viewer_id].set_data(dapi, mask, stride)
+        self.viewers[viewer_id].set_overlay_data(
+            fusion=(overlays or {}).get("fusion"),
+            markers=(overlays or {}).get("markers", {}),
+        )
+        if viewer_id == "A" or self.preview._dapi is None:
+            self.preview.set_data(dapi)
+        if self._preview_roi is not None:
+            self.viewers[viewer_id].set_roi_bounds(self._preview_roi)
         self._update_display_controls()
         self.status.setText(f"Loaded {viewer_id}: {run.run_id}")
 
@@ -278,10 +347,21 @@ class Step31ComparePage(QWidget):
 
     def _update_display_controls(self):
         show_outline = self.outline_chk.isChecked()
-        outline_width = self.width_slider.value()
+        outline_width = OUTLINE_WIDTH_OPTIONS[self.width_slider.value()]
+        self.width_label.setText(f"{outline_width:g} px")
         dapi_intensity = self.dapi_slider.value() / 100.0
+        mask_alpha = self.alpha_slider.value() / 100.0
+        channel_settings = self._current_channel_settings()
         for viewer in self.viewers.values():
-            viewer.set_display(show_outline, outline_width, dapi_intensity)
+            viewer.set_display(
+                show_outline=show_outline,
+                outline_width=outline_width,
+                dapi_intensity=dapi_intensity,
+                mask_alpha=mask_alpha,
+                show_dapi=self.dapi_chk.isChecked(),
+                show_fusion=self.fusion_chk.isChecked(),
+                channel_settings=channel_settings,
+            )
 
     def _choose_current_color(self):
         cur = QtGui.QColor(*self._outline_colors[self._selected_viewer])
@@ -295,3 +375,68 @@ class Step31ComparePage(QWidget):
     def _hex_to_rgb(value):
         color = QtGui.QColor(value)
         return (color.red(), color.green(), color.blue())
+
+    def _on_preview_roi_changed(self, bounds):
+        self._preview_roi = bounds
+        for viewer in self.viewers.values():
+            viewer.set_roi_bounds(bounds)
+        if bounds is None:
+            self.status.setText("ROI cleared")
+        else:
+            y0, y1, x0, x1 = bounds
+            self.status.setText(f"ROI y={y0}:{y1} x={x0}:{x1}")
+
+    def _rebuild_channel_controls(self):
+        while self.channel_lay.count():
+            item = self.channel_lay.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._channel_settings = {}
+        if not self._channels:
+            self.channel_lay.addWidget(QLabel("No marker channels found"))
+            return
+        for ch in self._channels[:24]:
+            row = QHBoxLayout()
+            chk = QCheckBox(ch.name)
+            chk.setChecked(False)
+            chk.toggled.connect(self._update_display_controls)
+            color_btn = QPushButton()
+            color_btn.setFixedWidth(24)
+            color_btn.setStyleSheet(f"background:{ch.color}; border:1px solid #666;")
+            alpha = QSlider(Qt.Horizontal)
+            alpha.setRange(0, 100)
+            alpha.setValue(int(ch.alpha * 100))
+            alpha.valueChanged.connect(self._update_display_controls)
+            self._channel_settings[ch.name] = {"check": chk, "color": ch.color, "alpha": alpha, "button": color_btn}
+            color_btn.clicked.connect(lambda _=False, name=ch.name: self._choose_channel_color(name))
+            row.addWidget(chk, stretch=2)
+            row.addWidget(color_btn)
+            row.addWidget(QLabel("alpha"))
+            row.addWidget(alpha, stretch=1)
+            self.channel_lay.addLayout(row)
+
+    def _current_channel_settings(self):
+        out = {}
+        for name, widgets in self._channel_settings.items():
+            color = QtGui.QColor(widgets["color"])
+            out[name] = {
+                "visible": widgets["check"].isChecked(),
+                "rgb": (color.red(), color.green(), color.blue()),
+                "alpha": widgets["alpha"].value() / 100.0,
+                "p_low": 1.0,
+                "p_high": 99.5,
+            }
+        return out
+
+    def _choose_channel_color(self, name):
+        widgets = self._channel_settings.get(name)
+        if not widgets:
+            return
+        cur = QtGui.QColor(widgets["color"])
+        color = QtWidgets.QColorDialog.getColor(cur, self, f"Channel color: {name}")
+        if not color.isValid():
+            return
+        widgets["color"] = color.name()
+        widgets["button"].setStyleSheet(f"background:{color.name()}; border:1px solid #666;")
+        self._update_display_controls()

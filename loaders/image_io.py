@@ -2,6 +2,7 @@
 
 import numpy as np
 import tifffile
+import zarr
 
 from configs.defaults import MAX_OVERVIEW_SIDE
 
@@ -27,6 +28,66 @@ def downsample_view(arr, stride):
     return arr[::stride, ::stride]
 
 
+def _zarr_array(root):
+    if hasattr(root, "ndim"):
+        return root
+    if hasattr(root, "keys"):
+        keys = list(root.keys())
+        if "0" in keys:
+            try:
+                return root[0]
+            except Exception:
+                return root["0"]
+        if keys:
+            return root[keys[0]]
+    return root
+
+
+def read_ome_channel_region(path, channel_index, y0, y1, x0, x1, stride=1):
+    """Read a 2D channel crop from OME-TIFF through tifffile zarr."""
+    tif = tifffile.TiffFile(path)
+    store = tif.aszarr()
+    try:
+        z0 = _zarr_array(zarr.open(store, mode="r"))
+        if z0.ndim == 4:
+            arr = z0[0, channel_index, y0:y1:stride, x0:x1:stride]
+        elif z0.ndim == 3:
+            arr = z0[channel_index, y0:y1:stride, x0:x1:stride]
+        elif z0.ndim == 2:
+            arr = z0[y0:y1:stride, x0:x1:stride]
+        else:
+            raise RuntimeError(f"Unsupported OME-TIFF dimensions: {z0.shape}")
+        return np.asarray(arr)
+    finally:
+        store.close()
+        tif.close()
+
+
+def zarr_group_names(path):
+    """Return top-level array/group names from a zarr store."""
+    if not path:
+        return []
+    root = zarr.open(path, mode="r")
+    if not hasattr(root, "keys"):
+        return []
+    return sorted(str(k) for k in root.keys())
+
+
+def read_zarr_channel(path, channel_name, roi_name=None, y0=0, y1=None, x0=0, x1=None, stride=1):
+    """Read a channel crop from corrected_channels.zarr style stores."""
+    root = zarr.open(path, mode="r")
+    arr = None
+    if roi_name and roi_name in root and channel_name in root[roi_name]:
+        arr = root[roi_name][channel_name]
+    elif channel_name in root:
+        arr = root[channel_name]
+    if arr is None:
+        raise KeyError(f"Channel not found: {channel_name}")
+    y1 = arr.shape[0] if y1 is None else y1
+    x1 = arr.shape[1] if x1 is None else x1
+    return np.asarray(arr[y0:y1:stride, x0:x1:stride])
+
+
 def normalize_u8(arr, p_low=1.0, p_high=99.5):
     a = np.asarray(arr, dtype=np.float32)
     finite = a[np.isfinite(a)]
@@ -42,6 +103,11 @@ def normalize_u8(arr, p_low=1.0, p_high=99.5):
     return (out * 255.0).astype(np.uint8)
 
 
+def normalize_float(arr, p_low=1.0, p_high=99.5):
+    u8 = normalize_u8(arr, p_low=p_low, p_high=p_high)
+    return u8.astype(np.float32) / 255.0
+
+
 def dapi_rgb(arr, intensity=1.0):
     u8 = normalize_u8(arr)
     scale = float(np.clip(intensity, 0.0, 3.0))
@@ -51,6 +117,34 @@ def dapi_rgb(arr, intensity=1.0):
     rgb[..., 0] = (blue.astype(np.float32) * 0.18).astype(np.uint8)
     rgb[..., 1] = (blue.astype(np.float32) * 0.34).astype(np.uint8)
     return rgb
+
+
+def compose_overlay_rgb(dapi, fusion=None, marker_layers=None, dapi_visible=True, fusion_visible=False):
+    """Compose DAPI, optional fusion, and marker overlays into RGB uint8."""
+    base_shape = np.asarray(dapi).shape[:2]
+    canvas = np.zeros(base_shape + (3,), dtype=np.float32)
+    if dapi_visible:
+        canvas += dapi_rgb(dapi).astype(np.float32) / 255.0
+    if fusion_visible and fusion is not None:
+        f = np.asarray(fusion)
+        if f.ndim == 3 and f.shape[2] >= 3:
+            frgb = f.astype(np.float32)
+            if frgb.max(initial=0) > 1.0:
+                frgb /= 255.0
+            canvas = np.maximum(canvas, frgb[:, :, :3])
+        else:
+            norm = normalize_float(f)
+            canvas[:, :, 0] = np.maximum(canvas[:, :, 0], norm)
+            canvas[:, :, 1] = np.maximum(canvas[:, :, 1], norm * 0.5)
+    for layer in marker_layers or []:
+        arr = layer.get("array")
+        if arr is None:
+            continue
+        color = np.asarray(layer.get("color", (255, 255, 255)), dtype=np.float32) / 255.0
+        alpha = float(np.clip(layer.get("alpha", 0.65), 0.0, 1.0))
+        norm = normalize_float(arr, layer.get("p_low", 1.0), layer.get("p_high", 99.5))
+        canvas += norm[:, :, None] * color[None, None, :] * alpha
+    return np.clip(canvas * 255.0, 0, 255).astype(np.uint8)
 
 
 def mask_outline(mask):
@@ -70,16 +164,27 @@ def mask_outline(mask):
 
 def outline_rgba(mask, color, width=1):
     outline = mask_outline(mask)
-    if width > 1:
+    width = float(width)
+    if width > 1.0:
         try:
             from scipy import ndimage as ndi
 
-            outline = ndi.binary_dilation(outline, iterations=int(width) - 1)
+            outline = ndi.binary_dilation(outline, iterations=max(1, int(round(width)) - 1))
         except Exception:
             pass
     rgba = np.zeros(outline.shape + (4,), dtype=np.uint8)
     rgba[outline, 0] = int(color[0])
     rgba[outline, 1] = int(color[1])
     rgba[outline, 2] = int(color[2])
-    rgba[outline, 3] = 230
+    rgba[outline, 3] = int(230 * max(0.25, min(1.0, width)))
+    return rgba
+
+
+def mask_fill_rgba(mask, color, alpha=0.0):
+    m = np.asarray(mask) > 0
+    rgba = np.zeros(m.shape + (4,), dtype=np.uint8)
+    rgba[m, 0] = int(color[0])
+    rgba[m, 1] = int(color[1])
+    rgba[m, 2] = int(color[2])
+    rgba[m, 3] = int(np.clip(alpha, 0.0, 1.0) * 180)
     return rgba

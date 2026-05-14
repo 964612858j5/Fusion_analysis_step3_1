@@ -12,6 +12,9 @@ class RoiRecord:
     manifest_path: str
     bbox_fullres: Optional[List[int]] = None
     shape: Optional[List[int]] = None
+    fusion_zarr: Optional[str] = None
+    corrected_zarr: Optional[str] = None
+    raw_ome: Optional[str] = None
 
 
 @dataclass
@@ -33,3 +36,12 @@ class RunRecord:
     def label(self) -> str:
         stamp = self.created_at or self.run_id
         return f"{self.display_name} - {stamp}"
+
+
+@dataclass
+class ChannelRecord:
+    name: str
+    source: str
+    color: str = "#ffffff"
+    alpha: float = 0.65
+    visible: bool = False

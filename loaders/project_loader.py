@@ -6,7 +6,8 @@ import os
 from typing import Dict, List, Optional
 
 from configs.defaults import METHOD_DISPLAY_NAMES
-from state.compare_state import RoiRecord, RunRecord
+from configs.defaults import DEFAULT_CHANNEL_COLORS
+from state.compare_state import ChannelRecord, RoiRecord, RunRecord
 
 
 def load_json(path, default=None):
@@ -54,6 +55,9 @@ class ProjectLoader:
                     manifest_path=manifest_path,
                     bbox_fullres=manifest.get("bbox_fullres"),
                     shape=manifest.get("shape"),
+                    fusion_zarr=self._find_fusion_source(roi_dir, manifest),
+                    corrected_zarr=self._find_corrected_source(roi_dir, manifest),
+                    raw_ome=_abs(self.project_dir, manifest.get("raw_ome") or manifest.get("ome_tiff")),
                 )
             )
 
@@ -72,8 +76,36 @@ class ProjectLoader:
                     manifest_path=manifest_path,
                     bbox_fullres=manifest.get("bbox_fullres"),
                     shape=manifest.get("shape"),
+                    fusion_zarr=self._find_fusion_source(roi_dir, manifest),
+                    corrected_zarr=self._find_corrected_source(roi_dir, manifest),
+                    raw_ome=_abs(self.project_dir, manifest.get("raw_ome") or manifest.get("ome_tiff")),
                 )
             )
+        return records
+
+    def channels_for_roi(self, roi: RoiRecord):
+        records = []
+        if roi.corrected_zarr and os.path.exists(roi.corrected_zarr):
+            try:
+                from loaders.image_io import zarr_group_names
+
+                names = zarr_group_names(roi.corrected_zarr)
+                if roi.roi_id in names:
+                    names = zarr_group_names(os.path.join(roi.corrected_zarr, roi.roi_id))
+                for i, name in enumerate(names):
+                    lower = name.lower()
+                    if lower in {"0", "1"} or lower.startswith("__"):
+                        continue
+                    records.append(
+                        ChannelRecord(
+                            name=name,
+                            source="corrected_zarr",
+                            color=DEFAULT_CHANNEL_COLORS[i % len(DEFAULT_CHANNEL_COLORS)],
+                            visible=False,
+                        )
+                    )
+            except Exception:
+                pass
         return records
 
     def runs_for_roi(self, roi: RoiRecord) -> List[RunRecord]:
@@ -153,4 +185,35 @@ class ProjectLoader:
             matches = sorted(glob.glob(os.path.join(base, pattern)))
             if matches:
                 return matches[0]
+        return None
+
+    def _find_fusion_source(self, roi_dir: str, manifest: Dict) -> Optional[str]:
+        candidates = [
+            manifest.get("fusion_zarr"),
+            manifest.get("fused_zarr"),
+            manifest.get("fusion_rgb_zarr"),
+            os.path.join(roi_dir, "step1", "fusion.zarr"),
+            os.path.join(roi_dir, "step1", "fused.zarr"),
+            os.path.join(roi_dir, "step1", "fused_channels.zarr"),
+            os.path.join(self.project_dir, "fusion.zarr"),
+            os.path.join(self.project_dir, "fused.zarr"),
+        ]
+        for candidate in candidates:
+            path = _abs(self.project_dir, candidate)
+            if path and os.path.exists(path):
+                return path
+        return None
+
+    def _find_corrected_source(self, roi_dir: str, manifest: Dict) -> Optional[str]:
+        candidates = [
+            manifest.get("corrected_zarr"),
+            manifest.get("corrected_channels_zarr"),
+            os.path.join(roi_dir, "step1", "corrected_channels.zarr"),
+            os.path.join(roi_dir, "step2", "corrected_channels.zarr"),
+            os.path.join(self.project_dir, "corrected_channels.zarr"),
+        ]
+        for candidate in candidates:
+            path = _abs(self.project_dir, candidate)
+            if path and os.path.exists(path):
+                return path
         return None
